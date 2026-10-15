@@ -1,10 +1,17 @@
 //! Explicit one-shot archive -> query database import. Never called by a read API.
 #[path = "btc_observation_db.rs"]
 mod observation_db;
+#[path="btc_typed.rs"]
+mod btc_typed;
+#[path="btc_typed_store.rs"]
+mod btc_typed_store;
+#[path="btc_typed_ingress.rs"]
+mod btc_typed_ingress;
 
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::Value;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::{io::{BufRead, BufReader}, path::{Path, PathBuf}};
 
@@ -221,6 +228,11 @@ fn main() -> Result<()> {
     let mut args=std::env::args_os().skip(1);
     let root=PathBuf::from(args.next().context("usage: marketcow-btc-db-migrate ROOT binance|chainlink")?);
     let source=args.next().context("source missing")?;
+    if source=="binance-typed" || source=="chainlink-typed" {
+        let from=PathBuf::from(args.next().context("typed migration requires explicit existing source database")?);
+        ensure!(args.next().is_none(),"unexpected typed migration option");
+        return import_typed_database(&root,&from,source=="binance-typed");
+    }
     if source=="binance-finalize" || source=="binance-finalize-staged" {
         ensure!(args.next().is_none(),"unexpected finalize option");
         return finalize(&root,source=="binance-finalize-staged");
@@ -249,6 +261,64 @@ fn main() -> Result<()> {
         resume_after.as_deref(),&include_earlier,batch_delay,stage_only)
 }
 
+/// Explicit, restartable database migration. It is never called by a business
+/// read or by WS ingestion. Old digest keys are opaque source row identities;
+/// no digest is computed or checked, and no archive file is opened.
+fn import_typed_database(root:&Path,from:&Path,binance:bool)->Result<()> {
+    use marketcow_contracts::typed_v3::common::Source;
+    use rusqlite::{OptionalExtension,params};
+    ensure!(root.is_absolute()&&from.is_absolute()&&from.is_file()&&!from.is_symlink(),"migration_source_invalid");
+    let source=rusqlite::Connection::open_with_flags(from,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    source.busy_timeout(std::time::Duration::from_secs(2))?;
+    let destination=root.join(if binance{"binance-trades/trades.sqlite3"}else{"chainlink-twap/observations.sqlite3"});
+    let mut target=btc_typed_store::open(&destination)?;
+    target.execute_batch("CREATE TABLE IF NOT EXISTS typed_legacy_imports(
+        source_database TEXT NOT NULL,source_evidence_key TEXT NOT NULL,
+        PRIMARY KEY(source_database,source_evidence_key))")?;
+    let source_identity=std::fs::canonicalize(from)?.to_string_lossy().into_owned();
+    let mut after=String::new();let mut frames=0u64;let mut inserted=0usize;let mut skipped=0u64;
+    loop {
+        // A short read transaction and at most 8MiB owned payloads per batch.
+        let mut stmt=source.prepare("SELECT sha256,length(raw) FROM evidence WHERE sha256>? ORDER BY sha256 LIMIT 64")?;
+        let keys=stmt.query_map([&after],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);if keys.is_empty(){break;}
+        let mut batch_bytes=0usize;
+        for (key,size) in keys {
+            ensure!(size>0 &&size<=1024*1024,"migration_evidence_capacity");
+            if batch_bytes>0 &&batch_bytes+size as usize>8*1024*1024 {break;}
+            batch_bytes+=size as usize;
+            let done:Option<i64>=target.query_row("SELECT 1 FROM typed_legacy_imports WHERE source_database=? AND source_evidence_key=?",params![source_identity,key],|r|r.get(0)).optional()?;
+            if done.is_some(){after=key;skipped+=1;continue;}
+            let (raw,received,generation,acquisition):(Vec<u8>,Option<String>,Option<String>,String)=source.query_row("SELECT raw,received_at,source_epoch,acquisition FROM evidence WHERE sha256=?",[&key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+            let received=received.filter(|s|!s.is_empty()).map(|s|chrono::DateTime::parse_from_rfc3339(&s).map(|t|t.timestamp_nanos_opt())).transpose()?.flatten();
+            // Missing legacy receipt stays absent; it never becomes source T.
+            let input=btc_typed_store::EvidenceInput{raw:&raw,acquisition:&acquisition,
+                upstream_url:if binance {if acquisition=="ws_trade"{"wss://data-stream.binance.vision/ws/btcusdt@trade"}else{"https://data-api.binance.vision/api/v3/trades?symbol=BTCUSDT&limit=1000"}}else{"wss://ws-live-v2.polymarket.com/ws"},
+                received_at_ns:received,source_generation:generation.as_deref(),content_type:"application/json"};
+            if binance {
+                let mut rows=if acquisition=="ws_trade" {vec![btc_typed_ingress::binance_trade(&raw,received.unwrap_or(0))?]}
+                    else if acquisition=="official_recent_trades"{btc_typed_ingress::binance_recent(&raw,received.unwrap_or(0))?}
+                    else{anyhow::bail!("migration_acquisition_unsupported")};
+                for row in &mut rows{row.received_at_ns=received;}
+                inserted+=btc_typed_store::insert_trades(&mut target,&rows,&input)?;
+            }else {
+                ensure!(acquisition=="authenticated_chainlink_ws","migration_acquisition_unsupported");
+                let mut parsed=btc_typed_ingress::chainlink(&raw,received.unwrap_or(0),Source::ChainlinkBtcUsdTwap60)?;
+                for row in &mut parsed.rows{row.received_at_ns=received;}
+                inserted+=btc_typed_store::insert_observations(&mut target,parsed.source,generation.as_deref().context("migration_generation_missing")?,&parsed.rows,&input)?;
+            }
+            // Crash between data commit and this checkpoint safely replays
+            // semantic identity checks, rather than skipping an unwritten row.
+            target.execute("INSERT OR IGNORE INTO typed_legacy_imports VALUES (?,?)",params![source_identity,key])?;
+            after=key;frames+=1;
+        }
+        eprintln!("typed migration committed_frames={frames} inserted_rows={inserted} already_imported={skipped}");
+    }
+    println!("typed migration complete: frames={frames} inserted_rows={inserted} skipped={skipped}; coverage is not certified");
+    Ok(())
+}
+
 #[cfg(test)]
 fn import(root:&Path,source:&str)->Result<()> {
     import_with_options(root,source,None,&[],std::time::Duration::ZERO,false)
@@ -258,6 +328,18 @@ fn import(root:&Path,source:&str)->Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn typed_database_migration_is_explicit_idempotent_and_preserves_lexical_fields() {
+        let root=tempfile::tempdir().unwrap();let source=root.path().join("existing.sqlite3");
+        let db=observation_db::open(&source).unwrap();
+        let raw=br#"{"e":"trade","s":"BTCUSDT","t":3,"T":1000,"E":1001,"p":"100.00","q":"0.0100","m":false}"#;
+        db.execute("INSERT INTO evidence VALUES (?,?,?,?,?)",rusqlite::params!["opaque-prior-row-id",raw.as_slice(),"2026-10-15T00:00:00Z","source-generation","ws_trade"]).unwrap();
+        import_typed_database(root.path(),&source,true).unwrap();import_typed_database(root.path(),&source,true).unwrap();
+        let target=btc_typed_store::open_reader(&root.path().join("binance-trades/trades.sqlite3")).unwrap();
+        let row=btc_typed_store::read_trade(&target,3).unwrap().unwrap();assert_eq!(row.price,"100.00");assert_eq!(row.quantity,"0.0100");assert_eq!(row.event_time_ms,Some(1001));
+        let evidence=btc_typed_store::read_evidence(&target,&row.evidence.unwrap().evidence_id).unwrap().unwrap();assert_eq!(evidence.raw_body,raw);
+        assert_eq!(target.query_row("SELECT COUNT(*) FROM typed_evidence",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
 
     #[test]
     fn explicit_import_is_idempotent_and_does_not_certify_coverage() {

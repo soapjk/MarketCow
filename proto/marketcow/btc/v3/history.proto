@@ -1,0 +1,93 @@
+syntax = "proto3";
+package marketcow.btc.history.v3;
+import "marketcow/common/v1/types.proto";
+import "marketcow/btc/v3/price.proto";
+
+message Range {
+  marketcow.common.v1.Source source = 1; // Only BINANCE_SPOT_TRADE.
+  string instrument_id = 2;
+  int64 start_time_ms = 3;
+  uint64 through_trade_id = 4;
+  uint32 limit = 5;
+}
+message PageRequest { Range range = 1; optional string page_token = 2; }
+message MissingRange { uint64 first_trade_id = 1; uint64 last_trade_id = 2; }
+message Health {
+  string state = 1;
+  optional string reason = 2;
+  optional uint64 last_success_sequence = 3;
+  optional int64 last_success_source_time_ms = 4;
+  optional int64 failed_at_ns = 5;
+  uint64 dropped_records = 6;
+}
+message Page {
+  string schema_version = 1; // marketcow.btc-trade-history.v3
+  string session_id = 2;
+  Range range = 3;
+  uint32 page_index = 4;
+  uint32 page_count = 5;
+  uint32 session_ttl_seconds = 6;
+  optional marketcow.btc.v3.Trade predecessor = 7; // Page 0 only.
+  repeated marketcow.btc.v3.Trade trades = 8;
+  optional string next_page_token = 9;
+  bool complete = 10; // Only final page, and only full requested coverage.
+  bool coverage_verified = 11;
+  optional string reason = 12;
+  repeated MissingRange missing_ranges = 13;
+  optional int64 coverage_first_time_ms = 14;
+  optional int64 coverage_last_time_ms = 15;
+  uint64 total_trade_count = 16;
+  Health database_health_at_freeze = 17;
+  Health archive_health_at_freeze = 18;
+  uint64 database_revision = 19; // Frozen-range repair revision, NOT append watermark.
+}
+message ReleaseRequest { string session_id = 1; Range range = 2; }
+message ReleaseReceipt {
+  string schema_version = 1;
+  string session_id = 2;
+  Range range = 3;
+  bool released = 4;
+}
+message EvidenceRequest { string evidence_id = 1; }
+message Evidence {
+  string schema_version = 1;
+  string evidence_id = 2;
+  bytes raw_body = 3;
+  string acquisition = 4;
+  string upstream_url = 5;
+  optional int64 received_at_ns = 6;
+  optional string source_generation = 7;
+  string content_type = 8;
+}
+// Separate observation history: never coerce Chainlink points into trade IDs.
+// The database row identity is storage-only, not a supplier sequence or time.
+message ObservationRange {
+  marketcow.common.v1.Source source = 1; // CHAINLINK_BTC_USD or ..._TWAP60
+  string instrument_id = 2;
+  int64 start_time_ms = 3; // Inclusive source time.
+  int64 end_time_ms = 4; // Exclusive source time; immutable for every page.
+  uint32 limit = 5;
+}
+message ObservationRecord {
+  uint64 observation_id = 1;
+  string source_generation = 2;
+  marketcow.btc.v3.Observation observation = 3;
+}
+message ObservationPageRequest { ObservationRange range = 1; optional string page_token = 2; }
+message ObservationPage {
+  string schema_version = 1; // marketcow.btc-observation-history.v3
+  ObservationRange range = 2;
+  repeated ObservationRecord observations = 3;
+  optional string next_page_token = 4;
+  bool complete = 5; // End of frozen result, NOT continuous market coverage.
+  bool coverage_verified = 6; // Separate supplier-prefix/gap evidence required.
+  optional string reason = 7;
+  uint64 frozen_high_observation_id = 8;
+  Health database_health_at_freeze = 9;
+}
+// History pages never inline original payloads. Evidence is an explicit
+// independent audit request. Normal reads use DB columns and indexes only.
+// Current resource budgets stay 1GiB/1024 pages/1024000 rows/4MiB per page,
+// TTL600/build120/max span960000ms. Release is identity-bound/idempotent.
+// No implicit archive/WS fallback; repair affecting a frozen range invalidates
+// that session. Appends beyond through_trade_id do not invalidate it.

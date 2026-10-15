@@ -1,0 +1,40 @@
+syntax = "proto3";
+package marketcow.facts.v1;
+import "marketcow/common/v1/types.proto";
+import "marketcow/polymarket/btc5m_market_local_v7.proto";
+
+message FactMeta {
+  marketcow.common.v1.RecordIdentity identity = 1;
+  marketcow.polymarket.btc5m.v7.MarketKey key = 2;
+  int64 observed_at_ns = 3; // Diagnostic; never effective/report/quote time.
+  repeated marketcow.common.v1.EvidenceReference evidence = 4;
+}
+message MarketRequest {
+  string request_id = 1;
+  marketcow.polymarket.btc5m.v7.MarketKey key = 2;
+}
+message UpstreamExchange {
+  string url = 1;
+  optional uint32 status = 2; // Absent if no HTTP response was received.
+  optional string content_type = 3;
+  optional string retry_after = 4; // Exact original HTTP header, not normalized.
+  optional int64 started_at_ns = 5;
+  optional int64 received_at_ns = 6;
+  optional uint64 duration_us = 7; // Monotonic local elapsed time.
+  optional bytes raw_body = 8; // Only explicit raw mode or failed exchange.
+  bool body_complete = 9;
+}
+message DispatchBinding {
+  marketcow.polymarket.btc5m.v7.MarketKey key = 1;
+  string stream_id = 2;
+  string token_id = 3;
+  int64 identity_checked_at_ns = 4;
+}
+message Failure {
+  marketcow.common.v1.Error error = 1;
+  string request_id = 2;
+  optional UpstreamExchange upstream = 3;
+  optional DispatchBinding dispatch = 4;
+}
+// Every application HTTP failure in this package uses Failure, never a JSON
+// envelope. The existing BTC v3 common.Error contract is unchanged.

@@ -1,0 +1,131 @@
+syntax = "proto3";
+package marketcow.polymarket.btc5m.v7;
+import "marketcow/common/v1/types.proto";
+
+message RulesRecord {
+  marketcow.common.v1.RecordIdentity identity = 1;
+  string market_id = 2;
+  string condition_id = 3;
+  string window_id = 4;
+  string start_at = 5;
+  string end_at = 6;
+  string up_token_id = 7;
+  string down_token_id = 8;
+  string description = 9;
+  string resolution_source = 10;
+  ResolutionTerms resolution = 11;
+  repeated marketcow.common.v1.EvidenceReference evidence = 12;
+}
+// Explicit rule extraction/configuration with provenance; never inferred from
+// the presence of a TWAP feed. Unverified/absent terms are not TWAP assurance.
+message ResolutionTerms {
+  string verification = 1; // verified | unverified | unsupported
+  optional string source_instrument = 2;
+  optional string quote_currency = 3;
+  optional string price_method = 4; // spot | twap
+  optional uint32 averaging_seconds = 5;
+  optional string opening_selection = 6;
+  optional string closing_selection = 7;
+  optional string interval_convention = 8;
+  optional string comparison = 9;
+  optional string equality_outcome = 10;
+  optional string provenance = 11; // official_rule | explicit_configuration
+  optional string evidence_id = 12;
+  optional string report_time_semantics = 13;
+  optional int64 opening_boundary_offset_ms = 14;
+  optional int64 closing_boundary_offset_ms = 15;
+  optional uint32 maximum_report_lookback_ms = 16;
+}
+
+message MarketKey {
+  string market_id = 1;
+  string condition_id = 2;
+  string window_id = 3;
+  string start_at = 4;
+  string end_at = 5;
+  string up_token_id = 6;
+  string down_token_id = 7;
+  reserved 8; // Former rule hash; never reused or populated.
+  marketcow.common.v1.RecordIdentity rules = 9;
+}
+message PriceLevel { string price = 1; string size = 2; }
+message Trade { string price = 1; optional string source_at = 2; }
+message Confirmation {
+  string source_at = 1;
+  string received_at = 2; // Diagnostic only.
+  string source = 3;
+  reserved 4, 5; // Former evidence/depth hashes.
+  string bound_quote_source_at = 6;
+  uint64 bound_book_revision = 7;
+  optional string evidence_id = 8;
+}
+message TokenMetadata {
+  string token_id = 1;
+  string outcome = 2;
+  optional string tick_size = 3;
+  optional string quote_source_at = 4;
+  optional Trade last_trade = 5;
+  optional Confirmation confirmation = 6;
+  bool data_valid = 7;
+  optional string invalid_reason = 8;
+  optional string received_at = 9;
+  uint64 book_revision = 10;
+}
+message TokenBook {
+  TokenMetadata metadata = 1;
+  repeated PriceLevel bids = 2;
+  repeated PriceLevel asks = 3;
+}
+message Snapshot {
+  repeated TokenBook books = 1; // Exactly Up, Down, complete replacement.
+  string source_status = 2;
+  optional string reason = 3;
+}
+message DepthChange { string token_id = 1; string side = 2; string price = 3; string size = 4; }
+message BookBase { string token_id = 1; uint64 book_revision = 2; }
+message PriceChange {
+  uint64 base_sequence = 1;
+  repeated DepthChange changes = 2;
+  repeated TokenMetadata post_metadata = 3; // Complete replacement per token.
+  string source_status = 4;
+  optional string reason = 5;
+  repeated BookBase base_books = 6;
+}
+message MarketFrame {
+  string schema_version = 1; // marketcow.polymarket.btc5m.market-local.v7
+  MarketKey key = 2;
+  string stream_id = 3;
+  uint64 state_sequence = 4;
+  reserved 5; // Former state hash.
+  string published_at = 6; // Diagnostic only.
+  oneof body { Snapshot snapshot = 10; PriceChange price_change = 11; }
+}
+message DeliveryBudget {
+  uint64 maximum_frame_bytes = 1;
+  uint64 maximum_state_bytes = 2; // Encoded typed Snapshot bytes, no preimage.
+  uint64 maximum_levels_per_side = 3;
+  uint64 maximum_changes = 4;
+}
+message MarketBinding { MarketKey key = 1; string role = 2; string stream_id = 3; }
+message MarketStreams {
+  string schema_version = 1;
+  repeated MarketBinding markets = 2;
+  DeliveryBudget delivery_budget = 3;
+}
+message RulesRequest { marketcow.common.v1.RecordIdentity identity = 1; }
+message MarketStreamRequest { string market_id = 1; string stream_id = 2; }
+// Same ordinary snapshot/absolute price_change semantics as v6. No SHA, no
+// JSON preimage, no checkpoint/ready/replay requirement for live consumers.
+// Revisions are producer state identities, not supplier sequence numbers.
+// Book revision advances only for depth/tick/quote-source/data-validity changes.
+// Receipt, last-trade and confirmation updates advance state only. Confirmation
+// binds the existing book revision; no circular identity. A delta carries exact recipient
+// base revisions and strictly advancing state sequence (not necessarily +1).
+// Private source switching sends an ordinary snapshot on the same stream.
+// Valid empty/single-sided books remain valid data. Absent optional clears it.
+// Freshness uses real quote/confirmation source clocks only.
+// base_books and post_metadata each contain exactly the two distinct bound
+// tokens in Up/Down order. Unchanged book facts keep revision; changed facts
+// strictly advance it. Snapshot may skip revisions, but the same book revision
+// cannot change depth/tick/quote-source/data-validity facts. Optional metadata
+// is complete replacement: absence clears prior facts, including confirmation.

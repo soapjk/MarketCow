@@ -1,85 +1,14 @@
-//! Thin official CLOB /book relay for the official-WS market-local candidate.
-//! This does not adjudicate a trade: the caller must fence its owner identity
-//! again after the response and validate the returned book, age and depth.
-use std::{
-    sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
-
+//! Public read-only official CLOB book acquisition. Tradude owns direct
+//! pre-order reads; this optional public data route is not a trading gate.
+use std::{sync::Arc, time::Duration};
 use anyhow::Result;
-use axum::{
-    Json, Router,
-    extract::{Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{IntoResponse, Response},
-    routing::get,
-};
-use serde::Deserialize;
-use serde_json::json;
-use sha2::{Digest, Sha256};
+use axum::{Router, extract::State, http::HeaderMap, response::{IntoResponse,Response}, routing::post};
 use tokio::sync::Semaphore;
-
-use crate::{
-    source_btc5m_api::{Control, WindowRole},
-    source_publication::MemoryReader,
-};
-
-const SCHEMA: &str = "marketcow.polymarket.official-ws-book-relay.v2";
-const ERROR_SCHEMA: &str = "marketcow.polymarket.official-ws-book-relay-error.v2";
-const MAX_BODY_BYTES: usize = 512 * 1024;
-const MAX_CLIENTS: usize = 32;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-
+use crate::{source_btc5m_api::Control,source_publication::MemoryReader};
+const MAX_CLIENTS:usize=32;
+const REQUEST_TIMEOUT:Duration=Duration::from_secs(2);
 #[derive(Clone)]
-struct Relay {
-    control: Control,
-    client: reqwest::Client,
-    slots: Arc<Semaphore>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BookQuery {
-    market_id: String,
-    condition_id: String,
-    token_id: String,
-    rule_sha256: String,
-    window_id: String,
-    start_at: String,
-    end_at: String,
-    up_token_id: String,
-    down_token_id: String,
-    stream_id: String,
-}
-
-fn now_ns() -> Option<u64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
-}
-
-fn header_if_valid(headers: &mut HeaderMap, name: &'static str, value: &str) {
-    if let Ok(value) = HeaderValue::from_str(value) {
-        headers.insert(name, value);
-    }
-}
-
-fn failure(status: StatusCode, code: &str, retryable: bool, request_id: &str) -> Response {
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    (
-        status,
-        headers,
-        Json(json!({
-            "schema_version":ERROR_SCHEMA,
-            "code":code,
-            "retryable":retryable,
-            "request_id":request_id,
-        })),
-    )
-        .into_response()
-}
+struct Relay {control:Control, client:reqwest::Client, slots:Arc<Semaphore>}
 
 pub fn router(control: Control, _reader: MemoryReader) -> Result<Router> {
     let client = reqwest::Client::builder()
@@ -88,232 +17,39 @@ pub fn router(control: Control, _reader: MemoryReader) -> Result<Router> {
         .timeout(REQUEST_TIMEOUT)
         .build()?;
     Ok(Router::new()
-        .route(
-            "/v1/prediction-markets/polymarket/research/btc-5m/official-ws/official-book",
-            get(http_book),
-        )
+        .route("/v1/facts/polymarket/official-book",post(http_native_book))
+        .layer(axum::extract::DefaultBodyLimit::max(64*1024))
         .with_state(Relay {
             control,
             client,
             slots: Arc::new(Semaphore::new(MAX_CLIENTS)),
         }))
 }
-
-async fn http_book(
-    State(relay): State<Relay>,
-    query: std::result::Result<Query<BookQuery>, axum::extract::rejection::QueryRejection>,
-) -> Response {
-    let request_id = uuid::Uuid::new_v4().simple().to_string();
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(_) => return failure(StatusCode::BAD_REQUEST, "invalid_query", false, &request_id),
-    };
-    if query.token_id.is_empty() || !query.token_id.bytes().all(|byte| byte.is_ascii_digit()) {
-        return failure(
-            StatusCode::BAD_REQUEST,
-            "invalid_token_id",
-            false,
-            &request_id,
-        );
-    }
-    let Ok(_permit) = relay.slots.clone().try_acquire_owned() else {
-        return failure(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "relay_capacity",
-            true,
-            &request_id,
-        );
-    };
-    let Ok((profile, _)) = relay.control.profile_for_market_source() else {
-        return failure(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "profile_unavailable",
-            true,
-            &request_id,
-        );
-    };
-    let Some(market) = profile
-        .markets
-        .iter()
-        .find(|market| market.market_id == query.market_id)
-    else {
-        return failure(
-            StatusCode::CONFLICT,
-            "identity_not_active",
-            false,
-            &request_id,
-        );
-    };
-    let public_identity=relay.control.live_identity(market);
-    if market.condition_id != query.condition_id
-        || market.rule_sha256 != query.rule_sha256
-        || !public_identity.as_ref().is_ok_and(|(key,id)|
-            id==&query.stream_id && key.window_id==query.window_id
-            && key.start_at==query.start_at && key.end_at==query.end_at
-            && key.up_token_id==query.up_token_id && key.down_token_id==query.down_token_id)
-        || matches!(&market.role, WindowRole::Retiring)
-        || !chrono::DateTime::parse_from_rfc3339(&market.start_at).ok()
-            .zip(chrono::DateTime::parse_from_rfc3339(&market.end_at).ok())
-            .is_some_and(|(start,end)|start<=chrono::Utc::now() && chrono::Utc::now()<end)
-        || !market
-            .outcomes
-            .iter()
-            .any(|outcome| outcome.token_id == query.token_id)
-    {
-        return failure(
-            StatusCode::CONFLICT,
-            "identity_not_active",
-            false,
-            &request_id,
-        );
-    }
-    let Some(checked_at) = now_ns() else {
-        return failure(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "clock_unavailable",
-            true,
-            &request_id,
-        );
-    };
-    let Some(started_at) = now_ns() else {
-        return failure(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "clock_unavailable",
-            true,
-            &request_id,
-        );
-    };
-    let started = Instant::now();
-    let response = match relay
-        .client
-        .get(format!(
-            "https://clob.polymarket.com/book?token_id={}",
-            query.token_id,
-        ))
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            return failure(
-                if error.is_timeout() {
-                    StatusCode::GATEWAY_TIMEOUT
-                } else {
-                    StatusCode::BAD_GATEWAY
-                },
-                if error.is_timeout() {
-                    "upstream_timeout"
-                } else {
-                    "upstream_transport_error"
-                },
-                true,
-                &request_id,
-            );
-        }
-    };
-    let status =
-        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let retry_after = response
-        .headers()
-        .get(header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let mut response = response;
-    let mut body = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) if body.len().saturating_add(chunk.len()) <= MAX_BODY_BYTES => {
-                body.extend_from_slice(&chunk)
+async fn http_native_book(State(relay):State<Relay>,headers:HeaderMap,
+    body:std::result::Result<axum::body::Bytes,axum::extract::rejection::BytesRejection>)->Response {
+    use marketcow_contracts::typed_v3::{self as native,facts};
+    use prost::Message;
+    use crate::source_facts_rest::{Failed,response};
+    let Ok(body)=body else{return Failed::local("","request_capacity",413).into_response()};
+    if body.len()>64*1024{return Failed::local("","request_capacity",413).into_response();}
+    if headers.get("content-type").and_then(|h|h.to_str().ok())!=Some(native::CONTENT_TYPE){return Failed::local("","unsupported_content_type",415).into_response();}
+    let request=match facts::OfficialBookRequest::decode(body){Ok(v)=>v,Err(_)=>return Failed::local("","invalid_request",400).into_response()};
+    let dispatch=match relay.control.native_dispatch(&request){Ok(v)=>v,Err(_)=>return Failed::local(&request.request_id,"identity_not_active",409).into_response()};
+    let identity=crate::source_facts_rest::provisional_identity();
+    let client=crate::source_facts_rest::Service::from_existing(relay.client.clone(),relay.slots.clone());
+    match client.book(&request,dispatch,identity).await {
+        Ok(mut value)=>{
+            value.identity=None;
+            let control=relay.control.clone();let mut semantic=value.clone();semantic.request_id.clear();semantic.upstream=None;
+            if let Some(dispatch)=&mut semantic.dispatch{dispatch.identity_checked_at_ns=0;}
+            let encoded=semantic.encode_to_vec();
+            let key=request.key.as_ref().map(|k|k.encode_to_vec()).unwrap_or_default();
+            let namespace=format!("book-{}",request.token_id);
+            match tokio::task::spawn_blocking(move||control.native_fact_record(&namespace,&key,&encoded)).await {
+                Ok(Ok(identity))=>{value.identity=Some(identity);response(200,&value,"marketcow.facts.v1.OfficialBookResponse",None)},
+                _=>Failed::local(&request.request_id,"database_unavailable",503).into_response(),
             }
-            Ok(Some(_)) => {
-                return failure(
-                    StatusCode::BAD_GATEWAY,
-                    "upstream_body_too_large",
-                    false,
-                    &request_id,
-                );
-            }
-            Ok(None) => break,
-            Err(error) => {
-                return failure(
-                    if error.is_timeout() {
-                        StatusCode::GATEWAY_TIMEOUT
-                    } else {
-                        StatusCode::BAD_GATEWAY
-                    },
-                    if error.is_timeout() {
-                        "upstream_timeout"
-                    } else {
-                        "upstream_transport_error"
-                    },
-                    true,
-                    &request_id,
-                );
-            }
-        }
+        },
+        Err(error)=>error.into_response(),
     }
-    let Some(received_at) = now_ns() else {
-        return failure(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "clock_unavailable",
-            true,
-            &request_id,
-        );
-    };
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    if let Some(value) = content_type.as_deref() {
-        header_if_valid(&mut headers, "content-type", value);
-    }
-    if let Some(value) = retry_after.as_deref() {
-        header_if_valid(&mut headers, "retry-after", value);
-    }
-    for (name, value) in [
-        ("x-marketcow-relay-schema", SCHEMA),
-        ("x-marketcow-candidate-source", "polymarket_official_ws"),
-        ("x-marketcow-relay-request-id", &request_id),
-        ("x-marketcow-market-id", &query.market_id),
-        ("x-marketcow-condition-id", &query.condition_id),
-        ("x-marketcow-token-id", &query.token_id),
-        ("x-marketcow-rule-sha256", &query.rule_sha256),
-        ("x-marketcow-window-id", &query.window_id),
-        ("x-marketcow-window-start-at", &query.start_at),
-        ("x-marketcow-window-end-at", &query.end_at),
-        ("x-marketcow-up-token-id", &query.up_token_id),
-        ("x-marketcow-down-token-id", &query.down_token_id),
-        ("x-marketcow-stream-id", &query.stream_id),
-    ] {
-        header_if_valid(&mut headers, name, value);
-    }
-    for (name, value) in [
-        (
-            "x-marketcow-identity-checked-at-unix-ns",
-            checked_at.to_string(),
-        ),
-        (
-            "x-marketcow-upstream-started-at-unix-ns",
-            started_at.to_string(),
-        ),
-        (
-            "x-marketcow-upstream-received-at-unix-ns",
-            received_at.to_string(),
-        ),
-        (
-            "x-marketcow-upstream-duration-us",
-            started.elapsed().as_micros().to_string(),
-        ),
-        ("x-marketcow-upstream-status", status.as_u16().to_string()),
-        (
-            "x-marketcow-upstream-body-sha256",
-            hex::encode(Sha256::digest(&body)),
-        ),
-    ] {
-        header_if_valid(&mut headers, name, &value);
-    }
-    (status, headers, body).into_response()
 }

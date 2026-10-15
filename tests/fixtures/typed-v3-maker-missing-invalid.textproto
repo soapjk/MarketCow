@@ -1,0 +1,19 @@
+schema_version: "marketcow.btc-price-stream.v3"
+producer_instance_id: "fixture-producer"
+stream_id: "fixture-source-generation-1"
+stream_sequence: 17
+source: BINANCE_SPOT_TRADE
+instrument_id: "BTCUSDT.BINANCE"
+source_sequence: 101
+published_at_ns: 1792023000000000000
+snapshot {
+  trades {
+    trade_id: 101
+    trade_time_ms: 1792023000000
+    price: "100.00"
+    quantity: "0.0100"
+  }
+  retained_count: 1
+  first_trade_id: 101
+  last_trade_id: 101
+}

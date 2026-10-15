@@ -9,9 +9,10 @@ use base64::Engine;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use marketcow_contracts::typed_v3::{self as typed_contract, btc as typed};
 use std::{
     collections::{BTreeMap, VecDeque},
     path::PathBuf,
@@ -22,8 +23,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{broadcast, mpsc};
-use crate::source_snapshot::Published;
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio_tungstenite::{
     connect_async_with_config,
     tungstenite::{Message, protocol::WebSocketConfig},
@@ -31,7 +31,6 @@ use tokio_tungstenite::{
 
 const WS_URL: &str = "wss://data-stream.binance.vision/ws/btcusdt@trade";
 const REST_URL: &str = "https://data-api.binance.vision/api/v3/trades?symbol=BTCUSDT&limit=1000";
-const SCHEMA: &str = "marketcow.btc-price-stream.v2";
 const INSTRUMENT: &str = "BTCUSDT.BINANCE";
 const MAX_TRADES: usize = 4096;
 const SNAPSHOT_TRADES: usize = 256;
@@ -50,69 +49,14 @@ const MARKET_WINDOW_MS: i64 = 300_000;
 
 #[path = "btc_trade_rest.rs"]
 pub mod official_rest;
-#[path = "btc_trade_history.rs"]
-pub mod history;
 #[path = "btc_trade_archive.rs"]
 pub mod archive;
-#[path = "btc_observation_db.rs"]
-pub mod observation_db;
-
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct WindowIdentity {
-    pub market_id: String,
-    pub condition_id: String,
-    pub window_id: String,
-    pub rule_sha256: String,
-    pub start_ms: i64,
-    pub end_ms: i64,
-}
 
 #[derive(Clone, Debug)]
 struct OpeningCandidate {
     start_ms: i64,
     price: Decimal,
-    source_epoch: Option<String>,
     source_epochs: Vec<String>,
-    seconds_sha256: String,
-    history_evidence_sha256: Option<String>,
-    evidence_kind: &'static str,
-}
-
-#[derive(Clone)]
-struct BoundOpening {
-    identity: WindowIdentity,
-    candidate: Arc<OpeningCandidate>,
-    evidence_sha256: String,
-}
-
-fn opening_binding_preimage(identity: &WindowIdentity, candidate: &OpeningCandidate) -> Vec<u8> {
-    // v2 is deliberately different from the former live-only v1: an opening
-    // reconstructed across source epochs cannot claim one fabricated epoch.
-    let mut bytes = b"marketcow.binance-opening-binding.v2\n".to_vec();
-    for part in [
-        identity.market_id.as_str(),
-        identity.condition_id.as_str(),
-        identity.window_id.as_str(),
-        identity.rule_sha256.as_str(),
-        candidate.seconds_sha256.as_str(),
-        candidate.evidence_kind,
-    ] {
-        bytes.extend_from_slice(part.as_bytes());
-        bytes.push(b'\n');
-    }
-    for epoch in &candidate.source_epochs {
-        bytes.extend_from_slice(b"epoch:");
-        bytes.extend_from_slice(epoch.as_bytes());
-        bytes.push(b'\n');
-    }
-    if let Some(history_hash) = &candidate.history_evidence_sha256 {
-        bytes.extend_from_slice(b"history:");
-        bytes.extend_from_slice(history_hash.as_bytes());
-        bytes.push(b'\n');
-    }
-    bytes.extend_from_slice(format!("{}|{}|{}", identity.start_ms,
-        identity.end_ms, candidate.price.normalize()).as_bytes());
-    bytes
 }
 
 #[derive(Clone)]
@@ -124,7 +68,7 @@ struct PriceSecond {
 
 #[derive(Clone, Default)]
 struct TradeTwap {
-    seconds: im::Vector<PriceSecond>,
+    seconds: VecDeque<PriceSecond>,
     last_time_ms: Option<i64>,
     last_price: Option<Decimal>,
 }
@@ -200,28 +144,6 @@ impl TradeTwap {
         Some(self.last_time_ms?.div_euclid(1000) * 1000)
     }
 
-    fn seconds_sha256_at(&self, end_ms: i64) -> Option<String> {
-        self.completed_at(end_ms)?;
-        let start_ms = end_ms.checked_sub(TWAP_SECONDS * 1000)?;
-        let mut hasher = Sha256::new();
-        hasher.update(b"marketcow.binance-opening-seconds.v1\n");
-        for second in self
-            .seconds
-            .iter()
-            .filter(|entry| entry.start_ms >= start_ms && entry.start_ms < end_ms)
-        {
-            hasher.update(
-                format!(
-                    "{}|{}|{}\n",
-                    second.start_ms,
-                    second.price_milliseconds.normalize(),
-                    second.covered_ms
-                )
-                .as_bytes(),
-            );
-        }
-        Some(hex::encode(hasher.finalize()))
-    }
 }
 
 enum Ingress {
@@ -261,10 +183,10 @@ async fn finish_reader(outcome: Result<()>, reader: tokio::task::JoinHandle<Resu
 
 #[derive(Clone)]
 pub struct Service {
-    state: Arc<Published<State>>,
-    live: broadcast::Sender<Arc<TradeEvent>>,
-    recovery: mpsc::Sender<RecoveryResult>,
-    window_bindings: Arc<arc_swap::ArcSwap<BTreeMap<i64,BoundOpening>>>,
+    state: Arc<RwLock<State>>,
+
+    typed_live: broadcast::Sender<Arc<crate::btc_typed::Published>>,
+    producer_instance_id: String,
     archive: mpsc::Sender<Archive>,
     archive_bytes: Arc<AtomicUsize>,
     archive_healthy: Arc<AtomicBool>,
@@ -274,7 +196,6 @@ pub struct Service {
     database_bytes: Arc<AtomicUsize>,
 }
 
-#[derive(Clone)]
 struct State {
     epoch: String,
     phase: &'static str,
@@ -282,63 +203,15 @@ struct State {
     serial: u64,
     sequence: u64,
     last_id: Option<u64>,
-    trades: im::Vector<Arc<TradePoint>>,
+    trades: VecDeque<typed::Trade>,
+    typed_generation: String,
     twap: TradeTwap,
-    opening_candidates: VecDeque<Arc<OpeningCandidate>>,
+    opening_candidates: VecDeque<OpeningCandidate>,
     opening_recovery_status: BTreeMap<i64, String>,
     checked_opening_boundary_ms: Option<i64>,
-    snapshot_raw_sha256: Option<String>,
-    snapshot_raw_base64: Option<RawBytes>,
-    snapshot_published_at: Option<String>,
+
     last_received_at: Option<String>,
     last_transport_at: Option<String>,
-}
-
-struct RecoveryResult {
-    boundary: i64,
-    result: Result<OpeningCandidate>,
-}
-
-/// Immutable event metadata. JSON encoding belongs to the socket consumer.
-pub struct TradeEvent {
-    snapshot: Option<Arc<State>>,
-    header:TradeHeader,
-    point: Option<Arc<TradePoint>>,
-    kind: &'static str,
-    emitted_at: chrono::DateTime<Utc>,
-}
-struct TradeHeader {
-    epoch:String,serial:u64,sequence:u64,last_id:Option<u64>,received_at:Option<String>,reason:String,
-}
-
-#[derive(Clone, Serialize)]
-struct TradePoint {
-    trade_id:u64,trade_time_ms:i64,event_time_ms:Option<i64>,
-    price:String,quantity:String,buyer_is_maker:bool,received_at:String,
-    source:&'static str,source_raw_sha256:String,
-    #[serde(skip_serializing_if="Option::is_none")]
-    source_row_index:Option<usize>,
-    #[serde(skip_serializing_if="Option::is_none")]
-    raw_frame_base64:Option<RawBytes>,
-    #[serde(skip)]
-    numeric_price:Decimal,
-}
-#[derive(Clone)]
-struct RawBytes(Arc<RawBytesInner>);
-struct RawBytesInner {
-    raw:Arc<[u8]>,
-    encoded:std::sync::OnceLock<String>,
-}
-impl RawBytes {
-    fn new(raw:Arc<[u8]>)->Self {
-        Self(Arc::new(RawBytesInner {raw,encoded:std::sync::OnceLock::new()}))
-    }
-}
-impl Serialize for RawBytes {
-    fn serialize<S:Serializer>(&self,s:S)->std::result::Result<S::Ok,S::Error> {
-        s.serialize_str(self.0.encoded.get_or_init(||
-            base64::engine::general_purpose::STANDARD.encode(&self.0.raw)))
-    }
 }
 
 #[derive(Clone)]
@@ -346,7 +219,15 @@ struct Archive {
     epoch: String,
     trade_id: Option<u64>,
     received_at: String,
-    raw: Arc<[u8]>,
+    raw: Vec<u8>,
+    trades: Vec<typed::Trade>,
+}
+impl Archive {
+    fn owned_bytes(&self)->usize {
+        std::mem::size_of::<Self>()+self.raw.capacity()+self.epoch.capacity()+self.received_at.capacity()
+            +self.trades.capacity()*std::mem::size_of::<typed::Trade>()
+            +self.trades.iter().map(|r|r.price.capacity()+r.quantity.capacity()+r.evidence.as_ref().map_or(0,|e|e.evidence_id.capacity())).sum::<usize>()
+    }
 }
 
 #[derive(Deserialize)]
@@ -374,27 +255,20 @@ struct RestTrade {
 }
 
 impl Service {
-    pub(crate) async fn history_seed(&self) -> Value {
-        let state = self.state.load();
-        json!({"source_epoch":state.epoch,"trades":state.trades,
-            "snapshot_raw_base64":state.snapshot_raw_base64,
-            "snapshot_raw_sha256":state.snapshot_raw_sha256,
-            "archive_health":self.archive_status.lock().unwrap().clone()})
-    }
     pub fn start(root: PathBuf) -> Self {
         let history_root = root.join("binance-trades");
-        let (live, _) = broadcast::channel(1024);
+
+        let (typed_live, _) = broadcast::channel(1024);
         let (archive, receiver) = mpsc::channel(ARCHIVE_RECORDS);
         let (database, db_receiver) = mpsc::channel(DATABASE_RECORDS);
         let archive_bytes = Arc::new(AtomicUsize::new(0));
         let database_bytes = Arc::new(AtomicUsize::new(0));
         let archive_healthy = Arc::new(AtomicBool::new(true));
-        let (recovery, recovered) = mpsc::channel(4);
         let service = Self {
-            state: Arc::new(Published::new(State::new())),
-            recovery,
-            window_bindings:Arc::new(arc_swap::ArcSwap::from_pointee(BTreeMap::new())),
-            live,
+            state: Arc::new(RwLock::new(State::new())),
+
+            typed_live,
+            producer_instance_id: uuid::Uuid::new_v4().to_string(),
             archive,
             archive_bytes: archive_bytes.clone(),
             archive_healthy: archive_healthy.clone(),
@@ -408,34 +282,55 @@ impl Service {
         tokio::task::spawn_blocking(move || database_task(db_root,db_receiver,database_bytes,db_status));
         tokio::task::spawn_blocking(move || archive_task(root, receiver, archive_bytes, archive_healthy, status));
         let owner = service.clone();
-        tokio::spawn(async move { owner.run(recovered).await });
+        tokio::spawn(async move { owner.run().await });
         let recovery_owner = service.clone();
         tokio::spawn(async move { recovery_owner.recover_opening_loop(history_root).await });
         service
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<Arc<TradeEvent>> {
-        self.live.subscribe()
+    pub fn typed_health(&self)->(Option<typed_contract::history::Health>,Option<typed_contract::history::Health>) {
+        let Ok(status)=self.archive_status.lock() else{return (None,None)};
+        let convert=|value:&Value|->Option<typed_contract::history::Health>{
+            let state=value["state"].as_str()?;
+            let at=|key:&str|value[key].as_str().and_then(|s|chrono::DateTime::parse_from_rfc3339(s).ok()).and_then(|t|t.timestamp_nanos_opt());
+            let dropped=value["dropped_records"].as_u64().unwrap_or(0);
+            Some(typed_contract::history::Health{state:if dropped>0&&state=="writing"{"writing_with_drops"}else{state}.into(),
+                reason:value["reason"].as_str().or_else(||value["last_drop_reason"].as_str()).or_else(||value["last_failure"]["reason"].as_str()).map(str::to_owned),
+                last_success_sequence:value["last_success_trade_id"].as_u64(),last_success_source_time_ms:value["last_success_source_time_ms"].as_i64(),
+                failed_at_ns:at("failed_at").or_else(||at("last_drop_at")).or_else(||value["last_failure"]["failed_at"].as_str().and_then(|s|chrono::DateTime::parse_from_rfc3339(s).ok()).and_then(|t|t.timestamp_nanos_opt())),dropped_records:dropped})
+        };
+        (convert(&status["database"]),convert(&status))
     }
-
-    pub async fn stream_snapshot(&self) -> Value {
-        let state = self.state.load();
-        if state.phase != "live" {
-            return unavailable(&state, &state.reason);
-        }
-        self.snapshot_frame(&state)
+    pub async fn typed_snapshot_and_subscribe(&self) -> Result<(Arc<crate::btc_typed::Published>, broadcast::Receiver<Arc<crate::btc_typed::Published>>)> {
+        let state=self.state.read().await;
+        let receiver=self.typed_live.subscribe();
+        Ok((crate::btc_typed::Published::new(self.typed_frame(&state,None)?)?,receiver))
+    }
+    fn typed_frame(&self,state:&State,payload:Option<typed::price_frame::Payload>)->Result<typed::PriceFrame> {
+        let now=Utc::now().timestamp_nanos_opt().context("clock_unavailable")?;
+        let payload=payload.unwrap_or_else(||if state.phase=="live" {
+            let trades=state.trades.iter().skip(state.trades.len().saturating_sub(SNAPSHOT_TRADES)).cloned().collect::<Vec<_>>();
+            typed::price_frame::Payload::Snapshot(typed::Snapshot{first_trade_id:trades.first().map(|r|r.trade_id),last_trade_id:trades.last().map(|r|r.trade_id),
+                retained_count:state.trades.len() as u64,truncated:state.trades.len()>SNAPSHOT_TRADES,trades,observations:Vec::new()})
+        }else{typed::price_frame::Payload::Status(typed::Status{phase:typed::Phase::Unavailable as i32,reason:Some(state.reason.clone())})});
+        Ok(typed::PriceFrame{schema_version:typed_contract::PRICE_SCHEMA.into(),producer_instance_id:self.producer_instance_id.clone(),stream_id:state.typed_generation.clone(),
+            stream_sequence:state.serial,source:typed_contract::common::Source::BinanceSpotTrade as i32,instrument_id:INSTRUMENT.into(),source_sequence:state.last_id,
+            published_at_ns:now,latest_source_age_ms_at_emit:state.trades.back().map(|r|now.div_euclid(1_000_000)-r.trade_time_ms),payload:Some(payload)})
+    }
+    fn publish_typed(&self,state:&State,payload:Option<typed::price_frame::Payload>)->Result<()> {
+        if self.typed_live.receiver_count()>0 {let _=self.typed_live.send(crate::btc_typed::Published::new(self.typed_frame(state,payload)?)?);}
+        Ok(())
     }
 
     pub async fn status(&self) -> Value {
-        let state = self.state.load();
+        let state = self.state.read().await;
         json!({"schema_version":"marketcow.binance-trade-status.v1",
             "source":"binance_spot_trade","instrument_id":INSTRUMENT,
             "source_epoch":state.epoch,"phase":state.phase,"reason":state.reason,
             "stream_serial":state.serial,"message_sequence":state.sequence,
             "last_trade_id":state.last_id,"last_received_at":state.last_received_at,
             "last_transport_at":state.last_transport_at,
-            "latest_trade_time_ms":state.trades.back()
-                .map(|trade| trade.trade_time_ms),
+            "latest_trade_time_ms":state.trades.back().map(|trade|trade.trade_time_ms),
             "freshness_policy":"consumer_explicit_max_trade_age_ms_required",
             "retained_trade_count":state.trades.len(),"retained_limit":MAX_TRADES,
             "archive_health":self.archive_status.lock().unwrap().clone(),
@@ -457,206 +352,126 @@ impl Service {
             "archive_dropped_records":self.archive_dropped.load(Ordering::Relaxed),
             "as_of":Utc::now().to_rfc3339()})
     }
+    pub async fn native_readings(&self,key:&typed_contract::market::MarketKey)->Result<(typed_contract::facts::ReadingState,typed_contract::facts::ReadingState)> {
+        use typed_contract::facts::{ReadingState,ReferenceReading};
+        let start=chrono::DateTime::parse_from_rfc3339(&key.start_at)?.timestamp_millis();
+        let end=chrono::DateTime::parse_from_rfc3339(&key.end_at)?.timestamp_millis();
+        let state=self.state.read().await;
+        let opening=state.opening_candidates.iter().find(|c|c.start_ms==start);
+        let reading=|price:Decimal,at:i64,purpose:&str,generations:Vec<String>|ReferenceReading {
+            purpose:purpose.into(),instrument_id:INSTRUMENT.into(),quote_currency:"USDT".into(),
+            price_method:"last_trade_price_time_weighted_over_preceding_60000ms".into(),price:price.normalize().to_string(),
+            boundary_time_ms:at,interval_start_ms:Some(at-60_000),interval_end_ms:Some(at),covered_ms:Some(60_000),
+            selection_rule:"carry_last_trade_between_contiguous_trade_ids".into(),verification:"binance_proxy_not_official".into(),
+            source_generations:generations,..Default::default()
+        };
+        let opening=match opening {
+            Some(c)=>ReadingState{available:true,reason:None,reading:Some(reading(c.price,start,"binance_preopen_proxy",c.source_epochs.clone()))},
+            None=>ReadingState{available:false,reason:Some(state.opening_recovery_status.get(&start).cloned().unwrap_or_else(||"complete_60s_coverage_unavailable".into())),reading:None},
+        };
+        let current=if state.phase=="live" {state.twap.latest_completed_end_ms().map(|t|t.min(end)).filter(|t|*t>=start)
+            .and_then(|at|state.twap.completed_at(at).map(|price|reading(price,at,"current_proxy",vec![state.epoch.clone()]))) }else{None};
+        let current=match current {
+            Some(reading)=>ReadingState{available:true,reason:None,reading:Some(reading)},
+            None=>ReadingState{available:false,reason:Some(if state.phase=="live"{"current_60s_coverage_unavailable"}else{"trade_source_unavailable"}.into()),reading:None},
+        };
+        Ok((opening,current))
+    }
 
     async fn recover_opening_loop(&self, root: PathBuf) {
         let mut interval = tokio::time::interval(Duration::from_secs(2));
         let mut last_attempt: Option<(i64, tokio::time::Instant)> = None;
         loop {
             interval.tick().await;
-            let snapshot = self.state.load();
-            let Some(time_ms) = snapshot.twap.last_time_ms else { continue };
-            if snapshot.phase != "live" { continue }
-            let boundary = time_ms.div_euclid(MARKET_WINDOW_MS) * MARKET_WINDOW_MS;
-            if snapshot.opening_candidates.iter().any(|entry| entry.start_ms == boundary)
-                || last_attempt.is_some_and(|(at, when)|
-                    at == boundary && when.elapsed() < Duration::from_secs(30)) { continue }
+            let boundary = {
+                let state = self.state.read().await;
+                if state.phase != "live" {
+                    continue;
+                }
+                let Some(time_ms) = state.twap.last_time_ms else {
+                    continue;
+                };
+                let boundary = time_ms.div_euclid(MARKET_WINDOW_MS) * MARKET_WINDOW_MS;
+                if state.opening_candidates.iter().any(|entry| entry.start_ms == boundary) {
+                    continue;
+                }
+                boundary
+            };
+            if last_attempt.is_some_and(|(at, when)| {
+                at == boundary && when.elapsed() < Duration::from_secs(30)
+            }) {
+                continue;
+            }
             last_attempt = Some((boundary, tokio::time::Instant::now()));
-            let seed = self.history_seed().await;
-            let history_root = root.clone();
-            let result = tokio::task::spawn_blocking(move ||
-                history::recover_opening(&history_root, &seed, boundary)).await
-                .unwrap_or_else(|error| Err(anyhow::anyhow!("history_recovery_worker_failed: {error}")));
-            if self.recovery.send(RecoveryResult { boundary, result }).await.is_err() { return }
-        }
-    }
-
-    fn apply_recovery(&self, state: &mut State, recovered: RecoveryResult) {
-        let boundary = recovered.boundary;
-        match recovered.result {
-            Ok(candidate) => {
-                if !state.opening_candidates.iter().any(|entry| entry.start_ms == boundary) {
-                    state.opening_candidates.push_back(Arc::new(candidate));
-                    while state.opening_candidates.len() > MAX_OPENING_WINDOWS {
-                        state.opening_candidates.pop_front();
-                    }
-                }
-                state.opening_recovery_status.remove(&boundary);
-            }
-            Err(error) => {
-                let detail = format!("{error:#}");
-                let code = detail.split(':').next().unwrap_or("history_recovery_unavailable");
-                state.opening_recovery_status.insert(boundary,
-                    if code.starts_with("history_") { code.to_owned() }
-                    else { "history_recovery_unavailable".to_owned() });
-            }
-        }
-        state.opening_recovery_status.retain(|start, _|
-            *start >= boundary - MARKET_WINDOW_MS * MAX_OPENING_WINDOWS as i64);
-        self.state.publish(state.clone());
-    }
-    /// This is a comparison signal, never a substitute for the venue reference.
-    pub async fn window_comparison(
-        &self,
-        identity: &WindowIdentity,
-        official_price: Option<Decimal>,
-    ) -> Value {
-        self.window_comparison_at(identity, official_price, Utc::now()).await
-    }
-
-    async fn window_comparison_at(
-        &self,
-        identity: &WindowIdentity,
-        official_price: Option<Decimal>,
-        now: chrono::DateTime<Utc>,
-    ) -> Value {
-        let state = self.state.load();
-        let start_ms = identity.start_ms;
-        let end_ms = identity.end_ms;
-        let valid_window = end_ms > start_ms && start_ms.rem_euclid(MARKET_WINDOW_MS) == 0;
-        // Binding immutable window facts is independent of live trade state.
-        // CAS makes concurrent first readers agree without taking an owner lock.
-        if valid_window {
-            let existing = self.window_bindings.load_full();
-            if !existing.contains_key(&start_ms) {
-                if let Some(candidate) = state.opening_candidates.iter()
-                    .find(|entry|entry.start_ms==start_ms).cloned() {
-                    let binding = BoundOpening {identity:identity.clone(),
-                        evidence_sha256:hex::encode(Sha256::digest(opening_binding_preimage(identity,&candidate))),
-                        candidate};
-                    self.window_bindings.rcu(|old| {
-                        let mut next=(**old).clone();
-                        next.entry(start_ms).or_insert_with(||binding.clone());
-                        while next.len()>MAX_OPENING_WINDOWS {
-                            let first=*next.keys().next().expect("nonempty bindings");
-                            next.remove(&first);
+            self.state.write().await.opening_recovery_status.insert(
+                boundary,
+                "history_recovery_pending".to_owned(),
+            );
+            let through={let state=self.state.read().await;state.trades.iter().find(|row|row.trade_time_ms>=boundary).map(|row|row.trade_id)};
+            let Some(through)=through else{continue};
+            let root = root.clone();
+            let recovered = tokio::task::spawn_blocking(move || {
+                recover_typed_opening(&root,boundary,through)
+            })
+            .await;
+            let mut state = self.state.write().await;
+            match recovered {
+                Ok(Ok(candidate)) => {
+                    if !state
+                        .opening_candidates
+                        .iter()
+                        .any(|entry| entry.start_ms == boundary)
+                    {
+                        marketcow_polymarket::diagnostic::emit(json!({
+                            "stage":"btc_opening_history_recovered",
+                            "window_start_ms":boundary,
+                            "source_epochs":candidate.source_epochs,
+                            "observed_at":Utc::now(),
+                        }).to_string());
+                        state.opening_candidates.push_back(candidate);
+                        while state.opening_candidates.len() > MAX_OPENING_WINDOWS {
+                            state.opening_candidates.pop_front();
                         }
-                        next
-                    });
+                    }
+                    state.opening_recovery_status.remove(&boundary);
+                }
+                other => {
+                    let detail = match other {
+                        Ok(Err(error)) => format!("{error:#}"),
+                        Err(join_error) => format!("history_recovery_worker_failed: {join_error}"),
+                        Ok(Ok(_)) => unreachable!(),
+                    };
+                    let reason = detail.split(':').next().unwrap_or("history_recovery_unavailable");
+                    let reason = if reason.starts_with("history_") {
+                        reason.to_owned()
+                    } else {
+                        "history_recovery_unavailable".to_owned()
+                    };
+                    state.opening_recovery_status.insert(boundary, reason.clone());
+                    marketcow_polymarket::diagnostic::emit(json!({
+                        "stage":"btc_opening_history_recovery_failed",
+                        "window_start_ms":boundary,
+                        "reason":reason,
+                        "detail":detail.chars().take(512).collect::<String>(),
+                        "observed_at":Utc::now(),
+                    }).to_string());
                 }
             }
+            state.opening_recovery_status.retain(|start, _| {
+                *start >= boundary - MARKET_WINDOW_MS * MAX_OPENING_WINDOWS as i64
+            });
         }
-        let bindings = self.window_bindings.load_full();
-        let bound = bindings.get(&start_ms).filter(|entry|entry.identity==*identity);
-        let opening = bound.map(|entry| entry.candidate.price);
-        let latest_end_ms = state
-            .twap
-            .latest_completed_end_ms()
-            .map(|latest| latest.min(end_ms));
-        let opening_available = valid_window && opening.is_some();
-        let current = if valid_window && state.phase == "live" {
-            latest_end_ms
-                .filter(|end| *end >= start_ms)
-                .and_then(|end| state.twap.completed_at(end))
-        } else {
-            None
-        };
-        let current_available = current.is_some();
-        let available = opening_available && current_available;
-        let mapped = opening.zip(current).zip(official_price).and_then(
-            |((opening, current), official_price)| {
-                (opening > Decimal::ZERO)
-                    .then_some(current)
-                    .and_then(|current| official_price.checked_mul(current))
-                    .and_then(|scaled| scaled.checked_div(opening))
-            },
-        );
-        json!({"schema_version":"marketcow.btc5m.binance-comparison.v3",
-            "source":"binance_spot_trade","instrument_id":INSTRUMENT,
-            "source_epoch":state.epoch,"available":available,
-            "reason":if available {"ready"} else if !opening_available {
-                "complete_60s_coverage_unavailable"
-            } else if state.phase != "live" {"trade_source_unavailable"}
-                else {"current_60s_coverage_unavailable"},
-            "opening_available":opening_available,
-            "opening_reason":if opening_available {"ready".to_owned()} else if !valid_window {
-                "invalid_market_window".to_owned()
-            } else {state.opening_recovery_status.get(&start_ms).cloned()
-                .unwrap_or_else(||"complete_60s_coverage_unavailable".to_owned())},
-            "current_available":current_available,
-            "current_reason":if current_available {"ready"} else if !valid_window {
-                "invalid_market_window"
-            } else if state.phase != "live" {"trade_source_unavailable"}
-                else {"current_60s_coverage_unavailable"},
-            "method":"last_trade_price_time_weighted_over_preceding_60000ms",
-            "quote_asset":"USDT","official_method_exactly_reproduced":false,
-            "carry_between_trades":true,"window_start_ms":start_ms,
-            "window_end_ms":end_ms,
-            "opening_interval_start_ms":start_ms.saturating_sub(60_000),
-            "opening_interval_end_ms":start_ms,
-            "opening_price_usdt":opening.map(|value| value.normalize().to_string()),
-            "opening_source_epoch":bound.and_then(|entry| entry.candidate.source_epoch.clone()),
-            "opening_source_epochs":bound.map(|entry| entry.candidate.source_epochs.clone()),
-            "opening_seconds_sha256":bound.map(|entry| entry.candidate.seconds_sha256.clone()),
-            "opening_history_evidence_sha256":bound.and_then(|entry| entry.candidate.history_evidence_sha256.clone()),
-            "opening_evidence_sha256":bound.map(|entry| entry.evidence_sha256.clone()),
-            "opening_covered_ms":bound.map(|_| TWAP_SECONDS * 1000),
-            "opening_evidence_kind":bound.map(|entry| entry.candidate.evidence_kind),
-            "current_interval_end_ms":latest_end_ms.filter(|_| current_available),
-            "current_price_usdt":current.map(|value| value.normalize().to_string()),
-            "mapped_official_scale_price":mapped.map(|value| value.normalize().to_string()),
-            "mapping_status":if official_price.is_some() {"official_reference_available"}
-                else {"official_reference_unavailable"},
-            "direction":opening.zip(current).map(|(opening,current)|
-                if current >= opening {"up"} else {"down"}),
-            "latest_trade_time_ms":state.twap.last_time_ms,
-            "latest_trade_age_ms_at_emit":state.twap.last_time_ms
-                .map(|at| now.timestamp_millis() - at),
-            "latest_trade_id":state.last_id,
-            "freshness_policy":"consumer_explicit_max_trade_age_ms_required",
-            "snapshot_is_not_execution_readiness":true,
-            "observed_at":now.to_rfc3339()})
     }
 
-    fn snapshot_frame(&self, state: &State) -> Value {
-        json!({"schema_version":SCHEMA,"type":"snapshot",
-            "source":"binance_spot_trade","instrument_id":INSTRUMENT,
-            "source_epoch":state.epoch,"stream_serial":state.serial,
-            "message_sequence":state.sequence,"source_sequence":state.last_id,
-            "source_sequence_scope":"BTCUSDT trade_id",
-            "source_continuity":"contiguous_trade_id_since_rest_ws_join",
-            "snapshot_kind":"rest_recent_trades_joined_to_ws",
-            "snapshot_raw_sha256":state.snapshot_raw_sha256,
-            "snapshot_raw_base64":state.snapshot_raw_base64,
-            "trades":state.trades.iter().rev().take(SNAPSHOT_TRADES).cloned()
-                .collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>(),
-            "first_snapshot_trade_id":state.trades.iter().rev().take(SNAPSHOT_TRADES)
-                .last().map(|trade| trade.trade_id),
-            "snapshot_truncated":state.trades.len()>SNAPSHOT_TRADES,
-            "retained_trade_count":state.trades.len(),
-            "retained_limit":MAX_TRADES,
-            "freshness_policy":"consumer_explicit_max_trade_age_ms_required",
-            "latest_trade_age_ms_at_emit":state.trades.back()
-                .map(|trade| trade.trade_time_ms)
-                .map(|at| Utc::now().timestamp_millis() - at),
-            "last_received_at":state.last_received_at,
-            "archive_diagnostics":{
-                "writer_healthy":self.archive_healthy.load(Ordering::Relaxed),
-                "dropped_records":self.archive_dropped.load(Ordering::Relaxed),
-                "health":self.archive_status.lock().unwrap().clone()},
-            "snapshot_joined_at":state.snapshot_published_at,
-            "response_at":Utc::now().to_rfc3339()})
-    }
-
-    async fn run(self, mut recovered: mpsc::Receiver<RecoveryResult>) {
-        let mut state = (*self.state.load()).clone();
+    async fn run(self) {
         let mut backoff_seconds = 1u64;
         let mut attempt = 0u64;
         loop {
             attempt = attempt.saturating_add(1);
-            self.invalidate(&mut state, "source_reconnecting").await;
+            self.invalidate("source_reconnecting").await;
             self.diagnostic("connecting", attempt, None).await;
-            if let Err(error) = self.run_once(&mut state, &mut recovered).await {
-                let had_live_join = state.phase == "live";
+            if let Err(error) = self.run_once().await {
+                let had_live_join = self.state.read().await.phase == "live";
                 let detail = format!("{error:#}").to_lowercase();
                 let reason = if detail.contains("id gap")
                     || detail.contains("id discontinuity")
@@ -678,7 +493,7 @@ impl Service {
                     "source_read_failed"
                 };
                 self.diagnostic(reason, attempt, Some(&error)).await;
-                self.invalidate(&mut state, reason).await;
+                self.invalidate(reason).await;
                 backoff_seconds = if had_live_join {
                     1
                 } else {
@@ -692,7 +507,7 @@ impl Service {
     }
 
     async fn diagnostic(&self, stage: &str, attempt: u64, error: Option<&anyhow::Error>) {
-        let state = self.state.load();
+        let state = self.state.read().await;
         // Fixed public endpoints only; no credentials or raw supplier frames.
         // emit is the existing bounded non-blocking diagnostic queue, independent
         // of EnvFilter and of raw archive health.
@@ -705,7 +520,7 @@ impl Service {
         }).to_string());
     }
 
-    async fn run_once(&self, state: &mut State, recovered: &mut mpsc::Receiver<RecoveryResult>) -> Result<()> {
+    async fn run_once(&self) -> Result<()> {
         let mut ws_config = WebSocketConfig::default();
         ws_config.max_message_size = Some(MAX_RAW_FRAME_BYTES);
         ws_config.max_frame_size = Some(MAX_RAW_FRAME_BYTES);
@@ -752,7 +567,7 @@ impl Service {
             }
             bail!("BTC trade WS ended")
         });
-        let outcome = self.join_and_consume(&mut rx, &overflow, state, recovered).await;
+        let outcome = self.join_and_consume(&mut rx, &overflow).await;
         finish_reader(outcome, reader_task).await
     }
 
@@ -760,8 +575,6 @@ impl Service {
         &self,
         rx: &mut mpsc::Receiver<Ingress>,
         overflow: &AtomicBool,
-        state: &mut State,
-        recovered: &mut mpsc::Receiver<RecoveryResult>,
     ) -> Result<()> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -791,10 +604,9 @@ impl Service {
             !rows.is_empty() && rows.len() <= 1000,
             "BTC recent trades empty/oversized"
         );
-        let raw_sha = hex::encode(Sha256::digest(&rest_raw));
         let mut trades = VecDeque::with_capacity(MAX_TRADES);
         let mut previous: Option<u64> = None;
-        for (index, row) in rows.iter().enumerate() {
+        for row in &rows {
             if let Some(id) = previous {
                 ensure!(
                     Some(row.id) == id.checked_add(1),
@@ -802,15 +614,16 @@ impl Service {
                 );
             }
             previous = Some(row.id);
-            trades.push_back(rest_point(row, index, &raw_sha, &rest_received_at)?);
+            trades.push_back(rest_point(row, &rest_received_at)?);
         }
         let rest_last = previous.context("BTC recent trades lack last ID")?;
-        let epoch = state.epoch.clone();
+        let epoch = self.state.read().await.epoch.clone();
         self.archive_raw(Archive {
             epoch,
             trade_id: None,
             received_at: rest_received_at,
-            raw: Arc::from(rest_raw.as_slice()),
+            raw: rest_raw.to_vec(),
+            trades: trades.iter().cloned().collect(),
         });
         // The socket was opened before REST. A matching WS trade proves the
         // bounded REST snapshot and the live stream overlap. No overlap means
@@ -822,8 +635,6 @@ impl Service {
                 !overflow.load(Ordering::Acquire),
                 "BTC trade ingress overflow"
             );
-            // One bounded recovery result per iteration; trade ingress stays ordered.
-            if let Ok(result) = recovered.try_recv() { self.apply_recovery(state, result); }
             let ingress = tokio::time::timeout(SOURCE_IDLE, rx.recv())
                 .await
                 .context("BTC trade WS idle")?
@@ -831,55 +642,59 @@ impl Service {
             let (raw, received_at) = match ingress {
                 Ingress::Trade(raw, received_at) => (raw, received_at),
                 Ingress::Heartbeat(received_at) => {
-                    state.last_transport_at = Some(received_at);
+                    self.state.write().await.last_transport_at = Some(received_at);
                     continue;
                 }
             };
             let trade: WsTrade = match serde_json::from_slice(&raw) {
                 Ok(trade) => trade,
                 Err(error) => {
-                    let epoch = state.epoch.clone();
+                    let epoch = self.state.read().await.epoch.clone();
                     self.archive_raw(Archive {
                         epoch,
                         trade_id: None,
                         received_at,
-                        raw:raw.into(),
+                        raw,
+                        trades: Vec::new(),
                     });
                     return Err(anyhow::Error::from(error).context("BTC trade WS parse failed"));
                 }
             };
             if trade.e != "trade" || trade.s != "BTCUSDT" {
-                let epoch = state.epoch.clone();
+                let epoch = self.state.read().await.epoch.clone();
                 self.archive_raw(Archive {
                     epoch,
                     trade_id: Some(trade.t),
                     received_at,
-                    raw:raw.into(),
+                    raw,
+                    trades: Vec::new(),
                 });
                 bail!("BTC trade wrong event or symbol");
             }
             let point = match ws_point(&trade, &raw, &received_at) {
                 Ok(point) => point,
                 Err(error) => {
-                    let epoch = state.epoch.clone();
+                    let epoch = self.state.read().await.epoch.clone();
                     self.archive_raw(Archive {
                         epoch,
                         trade_id: Some(trade.t),
                         received_at,
-                        raw:raw.into(),
+                        raw,
+                        trades: Vec::new(),
                     });
                     return Err(error);
                 }
             };
             if !joined {
-                state.last_transport_at = Some(received_at.clone());
+                self.state.write().await.last_transport_at = Some(received_at.clone());
                 if trade.t > rest_last {
-                    let epoch = state.epoch.clone();
+                    let epoch = self.state.read().await.epoch.clone();
                     self.archive_raw(Archive {
                         epoch,
                         trade_id: Some(trade.t),
                         received_at,
-                        raw:raw.into(),
+                        raw,
+                        trades: vec![point],
                     });
                     bail!("BTC trade REST/WS overlap missing");
                 }
@@ -890,23 +705,22 @@ impl Service {
                     );
                     joined = true;
                     self.commit_snapshot(
-                        state,
                         std::mem::take(&mut trades),
-                        raw_sha.clone(),
-                        rest_raw.to_vec(),
                     )
                     .await?;
                 }
-                let epoch = state.epoch.clone();
+                let epoch = self.state.read().await.epoch.clone();
                 self.archive_raw(Archive {
                     epoch,
                     trade_id: Some(trade.t),
                     received_at,
-                    raw:raw.into(),
+                    raw,
+                    trades: vec![point],
                 });
                 continue;
             }
             if trade.t <= last_id {
+                let mut state = self.state.write().await;
                 state.last_transport_at = Some(received_at.clone());
                 let prior = state
                     .trades
@@ -919,124 +733,125 @@ impl Service {
                     "BTC duplicate trade identity changed"
                 );
                 let epoch = state.epoch.clone();
+                drop(state);
                 self.archive_raw(Archive {
                     epoch,
                     trade_id: Some(trade.t),
                     received_at,
-                    raw:raw.into(),
+                    raw,
+                    trades: vec![point],
                 });
                 continue;
             }
             if trade.t != last_id.checked_add(1).context("BTC trade ID overflow")? {
-                let epoch = state.epoch.clone();
+                let epoch = self.state.read().await.epoch.clone();
                 self.archive_raw(Archive {
                     epoch,
                     trade_id: Some(trade.t),
                     received_at,
-                    raw:raw.into(),
+                    raw,
+                    trades: vec![point],
                 });
                 bail!("BTC trade ID gap: expected={} received={}", last_id.saturating_add(1), trade.t);
             }
             last_id = trade.t;
-            self.commit_trade(state, point, raw, received_at).await?;
+            self.commit_trade(point, raw, received_at).await?;
         }
     }
 
     async fn commit_snapshot(
-        &self, state: &mut State, trades: VecDeque<Arc<TradePoint>>, raw_sha: String, raw: Vec<u8>,
+        &self,
+        trades: VecDeque<typed::Trade>,
     ) -> Result<()> {
         let mut twap = TradeTwap::default();
         for trade in &trades {
-            twap.observe(trade.trade_time_ms, trade.numeric_price)?;
+            twap.observe(
+                trade.trade_time_ms,
+                Decimal::from_str(&trade.price)?,
+            )?;
         }
-        state.phase = "live";
-        state.reason.clear();
-        state.last_id = trades.back().map(|v|v.trade_id);
-        state.last_received_at = trades.back().map(|v|v.received_at.clone());
-        state.snapshot_raw_sha256 = Some(raw_sha);
-        state.snapshot_raw_base64 = Some(RawBytes::new(raw.into()));
-        state.snapshot_published_at = Some(Utc::now().to_rfc3339());
-        state.trades = trades.into_iter().collect();
-        state.twap = twap;
-        state.capture_opening_boundary();
-        state.serial = state.serial.checked_add(1).context("BTC trade serial overflow")?;
-        state.sequence = state.sequence.checked_add(1).context("BTC trade sequence overflow")?;
-        self.publish_event(state, None, "snapshot");
+        {
+            let mut state = self.state.write().await;
+            state.phase = "live";
+            state.reason.clear();
+            state.last_id = trades.back().map(|v|v.trade_id);
+            state.last_received_at = trades
+                .back()
+                .and_then(|v|v.received_at_ns).map(|t|chrono::DateTime::from_timestamp_nanos(t).to_rfc3339());
+
+            state.trades = trades;
+            state.typed_generation=state.epoch.clone();
+            state.twap = twap;
+            state.capture_opening_boundary();
+            state.serial += 1;
+            state.sequence += 1;
+            self.publish_typed(&state,None)?;
+        }
         self.diagnostic("live_snapshot_published", 0, None).await;
         Ok(())
     }
 
-    async fn commit_trade(&self, state: &mut State, point: Arc<TradePoint>, raw: Vec<u8>, received_at: String) -> Result<()> {
-        ensure!(state.phase == "live", "BTC trade source not joined");
-        let id = point.trade_id;
-        state.twap.observe(point.trade_time_ms, point.numeric_price)?;
-        state.capture_opening_boundary();
-        state.serial = state.serial.checked_add(1).context("BTC trade serial overflow")?;
-        state.sequence = state.sequence.checked_add(1).context("BTC trade sequence overflow")?;
-        state.last_id = Some(id);
-        state.last_received_at = Some(received_at.clone());
-        state.last_transport_at = Some(received_at.clone());
-        state.trades.push_back(point.clone());
-        while state.trades.len() > MAX_TRADES { state.trades.pop_front(); }
-        self.publish_event(state, Some(point), "trade");
-        self.archive_raw(Archive { epoch:state.epoch.clone(),trade_id:Some(id),received_at,raw:raw.into() });
+    async fn commit_trade(&self, point: typed::Trade, raw: Vec<u8>, received_at: String) -> Result<()> {
+        let (epoch, id) = {
+            let mut state = self.state.write().await;
+            ensure!(state.phase == "live", "BTC trade source not joined");
+            let id = point.trade_id;
+            state.twap.observe(
+                point.trade_time_ms,
+                Decimal::from_str(&point.price)?,
+            )?;
+            state.capture_opening_boundary();
+            state.serial = state
+                .serial
+                .checked_add(1)
+                .context("BTC trade serial overflow")?;
+            state.sequence = state
+                .sequence
+                .checked_add(1)
+                .context("BTC trade sequence overflow")?;
+            state.last_id = Some(id);
+            state.last_received_at = Some(received_at.clone());
+            state.last_transport_at = Some(received_at.clone());
+            state.trades.push_back(point.clone());
+            while state.trades.len() > MAX_TRADES {
+                state.trades.pop_front();
+            }
+            self.publish_typed(&state,Some(typed::price_frame::Payload::Trade(typed::TradeDelta{trade:Some(point.clone())})))?;
+            (state.epoch.clone(), id)
+        };
+        self.archive_raw(Archive {
+            epoch,
+            trade_id: Some(id),
+            received_at,
+            raw,
+            trades: vec![point],
+        });
         Ok(())
     }
 
-    fn publish_event(&self, state: &State, point: Option<Arc<TradePoint>>, kind: &'static str) {
-        self.state.publish(state.clone());
-        let event = TradeEvent {snapshot:if kind=="snapshot" {Some(self.state.load())}else{None},
-            header:TradeHeader {epoch:state.epoch.clone(),serial:state.serial,sequence:state.sequence,
-                last_id:state.last_id,received_at:state.last_received_at.clone(),reason:state.reason.clone()},
-            point,kind,emitted_at:Utc::now()};
-        let _ = self.live.send(Arc::new(event));
-    }
+    async fn invalidate(&self, reason: &str) {
+        {
+            let mut state = self.state.write().await;
+            state.epoch = uuid::Uuid::new_v4().simple().to_string();
+            state.phase = "unavailable";
+            state.reason = reason.to_owned();
+            state.sequence = 0;
+            state.serial = state.serial.saturating_add(1);
+            state.last_id = None;
+            state.trades.clear();
+            state.twap = TradeTwap::default();
+            state.checked_opening_boundary_ms = None;
 
-    pub fn event_frame(&self, event: &TradeEvent) -> Value {
-        match event.kind {
-            "snapshot" => self.snapshot_frame(event.snapshot.as_deref().expect("snapshot event state")),
-            "unavailable" => json!({"schema_version":SCHEMA,"type":"unavailable",
-                "source":"binance_spot_trade","instrument_id":INSTRUMENT,
-                "source_epoch":event.header.epoch,"stream_serial":event.header.serial,
-                "message_sequence":event.header.sequence,"source_sequence":Value::Null,
-                "reason":event.header.reason,"observed_at":event.emitted_at.to_rfc3339()}),
-            _ => {
-                let header = &event.header;
-                let point = event.point.as_ref().expect("trade event point");
-                json!({"schema_version":SCHEMA,"type":"trade","source":"binance_spot_trade",
-                    "instrument_id":INSTRUMENT,"source_epoch":header.epoch,
-                    "stream_serial":header.serial,"message_sequence":header.sequence,
-                    "source_sequence":header.last_id,"source_sequence_scope":"BTCUSDT trade_id",
-                    "source_continuity":"contiguous_trade_id_since_rest_ws_join","trade":point,
-                    "received_at":header.received_at,
-                    "latest_trade_age_ms_at_emit":event.emitted_at.timestamp_millis()
-                        - point.trade_time_ms,
-                    "published_at":event.emitted_at.to_rfc3339()})
-            }
+            state.last_received_at = None;
+            state.last_transport_at = None;
+            if let Err(error)=self.publish_typed(&state,None) {tracing::error!(%error,"btc_typed_status_failed");}
         }
     }
 
-    async fn invalidate(&self, state: &mut State, reason: &str) {
-        state.epoch = uuid::Uuid::new_v4().simple().to_string();
-        state.phase = "unavailable";
-        state.reason = reason.to_owned();
-        state.sequence = 0;
-        state.serial = state.serial.saturating_add(1);
-        state.last_id = None;
-        state.trades.clear();
-        state.twap = TradeTwap::default();
-        state.checked_opening_boundary_ms = None;
-        state.snapshot_raw_sha256 = None;
-        state.snapshot_raw_base64 = None;
-        state.snapshot_published_at = None;
-        state.last_received_at = None;
-        state.last_transport_at = None;
-        self.publish_event(state, None, "unavailable");
-    }
-
-    fn archive_raw(&self, record: Archive) {
+    fn archive_raw(&self, mut record: Archive) {
         self.queue_database(&record);
-        let size = record.raw.len();
+        record.trades=Vec::new(); // No duplicate typed payload in the raw archive queue.
+        let size = record.owned_bytes();
         if size > ARCHIVE_BYTES {
             self.archive_drop("archive_record_budget", &record);
             return;
@@ -1059,12 +874,14 @@ impl Service {
     }
     fn queue_database(&self,record:&Archive) {
         let Some(sender)=&self.database else {return};
-        let size=record.raw.len();
+        if record.trades.is_empty(){return;}
+        let queued=record.clone();
+        let size=queued.owned_bytes();
         if size>DATABASE_BYTES || self.database_bytes.fetch_update(Ordering::AcqRel,Ordering::Acquire,
             |used|used.checked_add(size).filter(|total|*total<=DATABASE_BYTES)).is_err() {
             self.database_drop("database_queue_bytes_exhausted",record);return;
         }
-        if let Err(error)=sender.try_send(record.clone()) {
+        if let Err(error)=sender.try_send(queued) {
             self.database_bytes.fetch_sub(size,Ordering::AcqRel);
             self.database_drop(if matches!(error,mpsc::error::TrySendError::Full(_))
                 {"database_queue_records_exhausted"}else{"database_worker_closed"},record);
@@ -1103,10 +920,7 @@ impl State {
             return;
         }
         self.checked_opening_boundary_ms = Some(boundary_ms);
-        let (Some(price), Some(seconds_sha256)) = (
-            self.twap.completed_at(boundary_ms),
-            self.twap.seconds_sha256_at(boundary_ms),
-        ) else {
+        let Some(price) = self.twap.completed_at(boundary_ms) else {
             return;
         };
         if self
@@ -1116,15 +930,11 @@ impl State {
         {
             return;
         }
-        self.opening_candidates.push_back(Arc::new(OpeningCandidate {
+        self.opening_candidates.push_back(OpeningCandidate {
             start_ms: boundary_ms,
             price,
-            source_epoch: Some(self.epoch.clone()),
             source_epochs: vec![self.epoch.clone()],
-            seconds_sha256,
-            history_evidence_sha256: None,
-            evidence_kind: "complete_trade_price_seconds_bound_to_market_identity",
-        }));
+        });
         while self.opening_candidates.len() > MAX_OPENING_WINDOWS {
             self.opening_candidates.pop_front();
         }
@@ -1138,26 +948,17 @@ impl State {
             serial: 0,
             sequence: 0,
             last_id: None,
-            trades: im::Vector::new(),
+            trades: VecDeque::new(),
+            typed_generation:uuid::Uuid::new_v4().to_string(),
             twap: TradeTwap::default(),
             opening_candidates: VecDeque::new(),
             opening_recovery_status: BTreeMap::new(),
             checked_opening_boundary_ms: None,
-            snapshot_raw_sha256: None,
-            snapshot_raw_base64: None,
-            snapshot_published_at: None,
+
             last_received_at: None,
             last_transport_at: None,
         }
     }
-}
-
-fn unavailable(state: &State, reason: &str) -> Value {
-    json!({"schema_version":SCHEMA,"type":"unavailable",
-        "source":"binance_spot_trade","instrument_id":INSTRUMENT,
-        "source_epoch":state.epoch,"stream_serial":state.serial,
-        "message_sequence":state.sequence,"source_sequence":Value::Null,
-        "reason":reason,"observed_at":Utc::now().to_rfc3339()})
 }
 
 fn validate_decimal(value: &str) -> Result<()> {
@@ -1166,70 +967,116 @@ fn validate_decimal(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn rest_point(row: &RestTrade, index: usize, raw_sha: &str, received_at: &str) -> Result<Arc<TradePoint>> {
+fn rest_point(row: &RestTrade, received_at: &str) -> Result<typed::Trade> {
     validate_decimal(&row.price)?;
     validate_decimal(&row.qty)?;
     ensure!(row.time > 0, "BTC trade invalid time");
-    Ok(Arc::new(TradePoint {trade_id:row.id,price:row.price.clone(),quantity:row.qty.clone(),
-        trade_time_ms:row.time,event_time_ms:None,buyer_is_maker:row.is_buyer_maker,
-        received_at:received_at.into(),source:"binance_spot_rest_recent",
-        source_raw_sha256:raw_sha.into(),source_row_index:Some(index),raw_frame_base64:None,
-        numeric_price:row.price.parse()?}))
+    Ok(typed::Trade{trade_id:row.id,trade_time_ms:row.time,event_time_ms:None,price:row.price.clone(),quantity:row.qty.clone(),
+        buyer_is_maker:Some(row.is_buyer_maker),received_at_ns:chrono::DateTime::parse_from_rfc3339(received_at)?.timestamp_nanos_opt(),evidence:None})
 }
 
-fn ws_point(row: &WsTrade, raw: &[u8], received_at: &str) -> Result<Arc<TradePoint>> {
+fn ws_point(row: &WsTrade, _raw: &[u8], received_at: &str) -> Result<typed::Trade> {
     validate_decimal(&row.p)?;
     validate_decimal(&row.q)?;
-    ensure!(row.trade_time_ms > 0 && row.event_time_ms > 0, "BTC trade invalid time");
-    Ok(Arc::new(TradePoint {trade_id:row.t,price:row.p.clone(),quantity:row.q.clone(),
-        trade_time_ms:row.trade_time_ms,event_time_ms:Some(row.event_time_ms),
-        buyer_is_maker:row.m,received_at:received_at.into(),source:"binance_spot_ws_trade",
-        source_raw_sha256:hex::encode(Sha256::digest(raw)),source_row_index:None,
-        raw_frame_base64:Some(RawBytes::new(Arc::from(raw))),numeric_price:row.p.parse()?}))
+    ensure!(
+        row.trade_time_ms > 0 && row.event_time_ms > 0,
+        "BTC trade invalid time"
+    );
+    Ok(typed::Trade{trade_id:row.t,trade_time_ms:row.trade_time_ms,event_time_ms:Some(row.event_time_ms),price:row.p.clone(),quantity:row.q.clone(),
+        buyer_is_maker:Some(row.m),received_at_ns:chrono::DateTime::parse_from_rfc3339(received_at)?.timestamp_nanos_opt(),evidence:None})
 }
 
-fn same_trade(a: &TradePoint, b: &TradePoint) -> bool {
-    a.trade_id == b.trade_id && a.price == b.price && a.quantity == b.quantity
-        && a.trade_time_ms == b.trade_time_ms && a.buyer_is_maker == b.buyer_is_maker
-        && (a.event_time_ms.is_none() || b.event_time_ms.is_none() || a.event_time_ms == b.event_time_ms)
+fn same_trade(a: &typed::Trade, b: &typed::Trade) -> bool {
+    a.trade_id==b.trade_id && a.trade_time_ms==b.trade_time_ms && a.buyer_is_maker==b.buyer_is_maker
+        && Decimal::from_str(&a.price).ok()==Decimal::from_str(&b.price).ok()
+        && Decimal::from_str(&a.quantity).ok()==Decimal::from_str(&b.quantity).ok()
+        && (a.event_time_ms.is_none()||b.event_time_ms.is_none()||a.event_time_ms==b.event_time_ms)
+}
+fn recover_typed_opening(root:&std::path::Path,boundary:i64,through:u64)->Result<OpeningCandidate> {
+    use rusqlite::{OptionalExtension,params};
+    let start=boundary.checked_sub(60_000).context("history_opening_boundary_invalid")?;
+    let mut db=crate::btc_typed_store::open_reader(&root.join("trades.sqlite3"))?;
+    let tx=db.transaction()?;
+    let predecessor:Option<i64>=tx.query_row("SELECT trade_id FROM typed_binance_trades WHERE trade_time_ms<? AND trade_id<=? ORDER BY trade_id DESC LIMIT 1",params![start,i64::try_from(through)?],|r|r.get(0)).optional()?;
+    let first=u64::try_from(predecessor.context("history_boundary_predecessor_missing")?)?;
+    let mut cursor=first;let mut previous=None;let mut previous_time=None;let mut count=0usize;
+    let mut twap=TradeTwap::default();let mut generations=Vec::<String>::new();let mut boundary_seen=false;
+    let deadline=std::time::Instant::now()+Duration::from_secs(120);
+    while cursor<=through {
+        ensure!(std::time::Instant::now()<deadline,"history_deadline");
+        let rows=crate::btc_typed_store::read_trades_with_generations(&tx,cursor,through,1000)?;
+        ensure!(!rows.is_empty(),"history_trade_id_gap");
+        for (row,generation) in rows {
+            ensure!(row.trade_id==cursor && previous.is_none_or(|p:u64|p.checked_add(1)==Some(row.trade_id)),"history_trade_id_gap");
+            ensure!(previous_time.is_none_or(|t|row.trade_time_ms>=t),"history_supplier_time_regression");
+            count+=1;ensure!(count<=1_024_000,"history_trade_capacity");
+            if row.trade_time_ms>=boundary {
+                let carried=twap.last_price.context("history_boundary_price_missing")?;
+                twap.observe(boundary,carried)?;boundary_seen=true;break;
+            }
+            let generation=generation.context("history_source_generation_missing")?;
+            if !generations.contains(&generation){ensure!(generations.len()<64,"history_opening_epoch_capacity");generations.push(generation);}
+            twap.observe(row.trade_time_ms,Decimal::from_str(&row.price)?)?;
+            previous=Some(row.trade_id);previous_time=Some(row.trade_time_ms);cursor=row.trade_id.checked_add(1).context("history_trade_id_range")?;
+        }
+        if boundary_seen{break;}
+    }
+    ensure!(boundary_seen,"history_boundary_successor_missing");
+    let price=twap.completed_at(boundary).context("history_opening_coverage_incomplete")?;
+    tx.commit()?;
+    Ok(OpeningCandidate{start_ms:boundary,price,source_epochs:generations})
 }
 
 fn database_task(root:PathBuf,mut rx:mpsc::Receiver<Archive>,bytes:Arc<AtomicUsize>,
     status:Arc<std::sync::Mutex<Value>>) {
     let path=root.join("binance-trades/trades.sqlite3");
-    let mut db=observation_db::open(&path).ok();
+    let open=||crate::btc_typed_store::open(&path);
+    let mut db=open().ok();
     while let Some(first)=rx.blocking_recv() {
         let mut batch=vec![first];
-        let mut batch_bytes=batch[0].raw.len();
+        let mut batch_bytes=batch[0].owned_bytes();
         std::thread::sleep(Duration::from_millis(3));
         while batch.len()<64 && batch_bytes<256*1024 {
             match rx.try_recv() {
-                Ok(next)=>{batch_bytes+=next.raw.len();batch.push(next)},
+                Ok(next)=>{batch_bytes+=next.owned_bytes();batch.push(next)},
                 Err(_)=>break,
             }
         }
         let last=batch.last().unwrap();
-        if db.is_none(){db=observation_db::open(&path).ok();}
-        let frames=batch.iter().map(|record|(record.raw.clone(),record.epoch.clone(),
-            record.received_at.clone())).collect::<Vec<_>>();
+        if db.is_none(){db=open().ok();}
         let result=db.as_mut().context("database_open_failed")
-            .and_then(|db|observation_db::ingest_binance_batch(db,&frames));
+            .and_then(|db|->Result<usize>{
+                let mut count=0;
+                for record in &batch {
+                    // Invalid supplier frames remain in the audit archive,
+                    // never masquerade as market records or fail the writer.
+                    if record.trades.is_empty() { continue; }
+                    count+=crate::btc_typed_store::insert_trades(db,&record.trades,&crate::btc_typed_store::EvidenceInput {
+                        raw:&record.raw,acquisition:if record.trade_id.is_some(){"ws_archive"}else{"official_recent_trades"},
+                        upstream_url:if record.trade_id.is_some(){WS_URL}else{REST_URL},
+                        received_at_ns:chrono::DateTime::parse_from_rfc3339(&record.received_at).ok().and_then(|t|t.timestamp_nanos_opt()),
+                        source_generation:Some(&record.epoch),content_type:"application/json",
+                    })?;
+                }
+                Ok(count)
+            });
         bytes.fetch_sub(batch_bytes,Ordering::AcqRel);
         match result {
             Ok(_) => {
                 let mut health=status.lock().unwrap();
                 health["database"]["state"]="writing".into();
                 health["database"]["last_success_at"]=json!(Utc::now());
-                health["database"]["last_success_trade_id"]=json!(last.trade_id);
+                health["database"]["last_success_trade_id"]=json!(last.trades.last().map(|t|t.trade_id));
+                health["database"]["last_success_source_time_ms"]=json!(last.trades.last().map(|t|t.trade_time_ms));
                 health["database"]["reason"]=Value::Null;
                 health["database"]["failed_at"]=Value::Null;
             }
             Err(error) => {
-                if let Some(open)=db.as_ref(){observation_db::mark_error(open,"binance_spot_trade",&format!("{error:#}"));}
                 let mut health=status.lock().unwrap();
                 health["database"]["state"]="failed_retrying".into();
                 health["database"]["failed_at"]=json!(Utc::now());
-                health["database"]["reason"]=format!("{error:#}").chars().take(256).collect::<String>().into();
+                health["database"]["reason"]=database_failure_code(&error).into();
+                health["database"]["detail"]=format!("{error:#}").chars().take(256).collect::<String>().into();
                 health["database"]["last_attempt_trade_id"]=json!(last.trade_id);
                 health["database"]["failed_batch_records"]=json!(batch.len());
                 marketcow_polymarket::diagnostic::emit(json!({"stage":"btc_observation_db_failed",
@@ -1239,6 +1086,24 @@ fn database_task(root:PathBuf,mut rx:mpsc::Receiver<Archive>,bytes:Arc<AtomicUsi
             }
         }
     }
+}
+
+fn database_failure_code(error:&anyhow::Error)->&'static str {
+    use rusqlite::ErrorCode;
+    for cause in error.chain() {
+        if let Some(rusqlite::Error::SqliteFailure(code,_))=cause.downcast_ref::<rusqlite::Error>() {
+            return match code.code {
+                ErrorCode::DiskFull=>"database_disk_full",
+                ErrorCode::PermissionDenied|ErrorCode::ReadOnly=>"database_permission_denied",
+                ErrorCode::DatabaseBusy|ErrorCode::DatabaseLocked=>"database_busy",
+                ErrorCode::CannotOpen=>"database_open_failed",
+                ErrorCode::DatabaseCorrupt|ErrorCode::NotADatabase=>"database_corrupt",
+                ErrorCode::SystemIoFailure=>"database_io_failed",
+                _=>"database_write_failed",
+            };
+        }
+    }
+    if error.to_string().contains("identity conflict"){"database_identity_conflict"}else{"database_write_failed"}
 }
 
 fn archive_task(
@@ -1277,7 +1142,7 @@ fn archive_task(
     let mut writer=None;
     let mut written_records=0u64;
     while let Some(record)=rx.blocking_recv() {
-        let raw_size=record.raw.len();
+        let raw_size=record.owned_bytes();
         let result=(|| -> Result<()> {
             if writer.is_none() {
                 writer=Some(archive::Writer::open(root.clone(),"raw",true,archive::SEGMENT_BYTES)?);
@@ -1331,128 +1196,83 @@ fn archive_task(
 mod tests {
     use super::*;
 
-    pub(super) fn test_service(state:State)->Service {
-        let (live,_)=broadcast::channel(16);
-        let (archive,_)=mpsc::channel(16);
-        Service {state:Arc::new(Published::new(state)),live,archive,
-            recovery:mpsc::channel(4).0,
-            window_bindings:Arc::new(arc_swap::ArcSwap::from_pointee(BTreeMap::new())),
-            archive_bytes:Arc::new(AtomicUsize::new(0)),archive_healthy:Arc::new(AtomicBool::new(true)),
-            archive_dropped:Arc::new(AtomicU64::new(0)),archive_status:Arc::new(std::sync::Mutex::new(Value::Null)),
-            database:None,database_bytes:Arc::new(AtomicUsize::new(0))}
+    fn publication_service() -> Service {
+        Service {
+            typed_live: broadcast::channel(1024).0,
+            producer_instance_id: "test-producer".into(),
+            state: Arc::new(RwLock::new(State::new())),
+            archive: mpsc::channel(16).0,
+            archive_bytes: Arc::new(AtomicUsize::new(0)),
+            archive_healthy: Arc::new(AtomicBool::new(true)),
+            archive_dropped: Arc::new(AtomicU64::new(0)),
+            archive_status: Arc::new(std::sync::Mutex::new(Value::Null)),
+            database: None,
+            database_bytes: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     #[tokio::test]
-    async fn binance_window_remains_available_without_official_reference() {
-        let mut state = State::new();
-        state.phase = "live";
-        state.twap.observe(240_000, Decimal::from(100)).unwrap();
-        state.twap.observe(270_000, Decimal::from(200)).unwrap();
-        state.twap.observe(300_000, Decimal::from(300)).unwrap();
-        state.twap.observe(360_000, Decimal::from(400)).unwrap();
-        state.capture_opening_boundary();
-        let identity = WindowIdentity {
-            market_id: "market-a".into(),
-            condition_id: "condition-a".into(),
-            window_id: "window-a".into(),
-            rule_sha256: "rule-a".into(),
-            start_ms: 300_000,
-            end_ms: 600_000,
-        };
-        let service = test_service(state);
-        let without = service.window_comparison(&identity, None).await;
-        assert_eq!(without["available"], true);
-        assert_eq!(without["opening_price_usdt"], "150");
-        assert_eq!(without["current_price_usdt"], "300");
-        assert_eq!(without["direction"], "up");
-        assert!(without["mapped_official_scale_price"].is_null());
-        assert_eq!(without["mapping_status"], "official_reference_unavailable");
-        let with = service
-            .window_comparison(&identity, Some(Decimal::from(1000)))
-            .await;
-        assert_eq!(with["mapped_official_scale_price"], "2000");
+    async fn native_recovery_uses_same_subscription_without_legacy_envelopes() {
+        let service = publication_service();
+        let (_, mut receiver) = service.typed_snapshot_and_subscribe().await.unwrap();
+        service.invalidate("source_read_failed").await;
+        assert!(matches!(receiver.recv().await.unwrap().frame.payload, Some(typed::price_frame::Payload::Status(_))));
+        let row: WsTrade = serde_json::from_slice(first_raw()).unwrap();
+        let point = ws_point(&row, first_raw(), "2026-10-08T00:00:00Z").unwrap();
+        service.commit_snapshot(VecDeque::from([point])).await.unwrap();
+        let snapshot = receiver.recv().await.unwrap();
+        assert!(matches!(snapshot.frame.payload, Some(typed::price_frame::Payload::Snapshot(_))));
+        let row: WsTrade = serde_json::from_slice(second_raw()).unwrap();
+        let point = ws_point(&row, second_raw(), "2026-10-08T00:00:00Z").unwrap();
+        service.commit_trade(point, second_raw().to_vec(), "2026-10-08T00:00:00Z".into()).await.unwrap();
+        let delta = receiver.recv().await.unwrap();
+        assert_eq!(delta.frame.stream_sequence, snapshot.frame.stream_sequence + 1);
+        assert!(matches!(delta.frame.payload, Some(typed::price_frame::Payload::Trade(_))));
+    }
 
-        service.invalidate(&mut (*service.state.load()).clone(), "source_reconnecting").await;
-        let reconnecting = service.window_comparison(&identity, None).await;
-        assert_eq!(reconnecting["opening_available"], true);
-        assert_eq!(reconnecting["opening_price_usdt"], "150");
-        assert_eq!(reconnecting["current_available"], false);
-        assert_eq!(reconnecting["current_reason"], "trade_source_unavailable");
-        assert_eq!(
-            reconnecting["opening_source_epoch"],
-            without["opening_source_epoch"]
-        );
-        assert_eq!(
-            reconnecting["opening_evidence_sha256"],
-            without["opening_evidence_sha256"]
-        );
-
-        let different_rule = WindowIdentity {
-            rule_sha256: "rule-b".into(),
-            ..identity
-        };
-        let rebound = service.window_comparison(&different_rule, None).await;
-        assert_eq!(rebound["opening_available"], false);
-        assert!(rebound["opening_evidence_sha256"].is_null());
+    #[test]
+    fn native_opening_recovery_is_database_only_and_rejects_real_gap() {
+        let root = tempfile::tempdir().unwrap();
+        let mut db = crate::btc_typed_store::open(&root.path().join("trades.sqlite3")).unwrap();
+        let rows = [(1, 59_000, "100.00"), (2, 60_000, "120.00"), (3, 90_000, "140.00"), (4, 120_000, "900.00")]
+            .into_iter().map(|(trade_id, trade_time_ms, price)| typed::Trade {
+                trade_id, trade_time_ms, price: price.into(), quantity: "0.0100".into(),
+                buyer_is_maker: Some(false), ..Default::default()
+            }).collect::<Vec<_>>();
+        crate::btc_typed_store::insert_trades(&mut db, &rows, &crate::btc_typed_store::EvidenceInput {
+            raw: b"opaque audit evidence not parsed by business history", acquisition: "ws_archive",
+            upstream_url: WS_URL, received_at_ns: None, source_generation: Some("source-a"), content_type: "application/json"
+        }).unwrap();
+        let opening = recover_typed_opening(root.path(), 120_000, 4).unwrap();
+        assert_eq!(opening.price, Decimal::from(130));
+        assert_eq!(opening.source_epochs, ["source-a"]);
+        db.execute("DELETE FROM typed_binance_trades WHERE trade_id=3", []).unwrap();
+        assert!(recover_typed_opening(root.path(), 120_000, 4).is_err());
     }
 
     #[tokio::test]
-    async fn incomplete_opening_coverage_is_not_fabricated() {
-        let mut state = State::new();
-        state.phase = "live";
-        state.twap.observe(250_001, Decimal::from(100)).unwrap();
-        state.twap.observe(300_000, Decimal::from(110)).unwrap();
-        state.capture_opening_boundary();
-        let identity = WindowIdentity {
-            market_id: "market-a".into(),
-            condition_id: "condition-a".into(),
-            window_id: "window-a".into(),
-            rule_sha256: "rule-a".into(),
-            start_ms: 300_000,
-            end_ms: 600_000,
+    async fn native_opening_is_independent_of_current_source_and_official_reference() {
+        let service = publication_service();
+        let key = typed_contract::market::MarketKey {
+            start_at: "1970-01-01T00:05:00Z".into(),
+            end_at: "1970-01-01T00:10:00Z".into(),
+            ..Default::default()
         };
-        let service = test_service(state);
-        let result = service.window_comparison(&identity, None).await;
-        assert_eq!(result["opening_available"], false);
-        assert!(result["opening_price_usdt"].is_null());
-        assert_eq!(
-            result["opening_reason"],
-            "complete_60s_coverage_unavailable"
-        );
-    }
-
-    #[tokio::test]
-    async fn recovered_cross_epoch_opening_has_explicit_provenance_and_no_current_claim() {
-        let mut state = State::new();
-        state.phase = "live";
-        state.opening_candidates.push_back(Arc::new(OpeningCandidate {
-            start_ms: 300_000,
-            price: Decimal::from(150),
-            source_epoch: None,
-            source_epochs: vec!["old-epoch".into(), "new-epoch".into()],
-            seconds_sha256: "verified-seconds".into(),
-            history_evidence_sha256: Some("verified-history".into()),
-            evidence_kind: "verified_original_trade_history_price_seconds",
-        }));
-        let identity = WindowIdentity {
-            market_id: "market-a".into(),
-            condition_id: "condition-a".into(),
-            window_id: "window-a".into(),
-            rule_sha256: "rule-a".into(),
-            start_ms: 300_000,
-            end_ms: 600_000,
-        };
-        let service = test_service(state);
-        let result = service.window_comparison(&identity, None).await;
-        assert_eq!(result["schema_version"], "marketcow.btc5m.binance-comparison.v3");
-        assert_eq!(result["opening_available"], true);
-        assert_eq!(result["opening_price_usdt"], "150");
-        assert_eq!(result["opening_source_epoch"], Value::Null);
-        assert_eq!(result["opening_source_epochs"], json!(["old-epoch", "new-epoch"]));
-        assert_eq!(result["opening_history_evidence_sha256"], "verified-history");
-        assert_eq!(result["current_available"], false);
-        assert_eq!(result["available"], false);
-        assert!(result["mapped_official_scale_price"].is_null());
+        assert!(!service.native_readings(&key).await.unwrap().0.available);
+        {
+            let mut state = service.state.write().await;
+            state.phase = "live";
+            state.twap.observe(240_000, Decimal::from(100)).unwrap();
+            state.twap.observe(270_000, Decimal::from(200)).unwrap();
+            state.twap.observe(300_000, Decimal::from(900)).unwrap();
+            state.capture_opening_boundary();
+        }
+        let (opening, _) = service.native_readings(&key).await.unwrap();
+        assert_eq!(opening.reading.unwrap().price, "150");
+        service.invalidate("disconnected").await;
+        let (opening, current) = service.native_readings(&key).await.unwrap();
+        assert!(opening.available);
+        assert!(!current.available);
     }
 
     #[test]
@@ -1514,12 +1334,12 @@ mod tests {
             time: 1791417600000,
             is_buyer_maker: true,
         };
-        let rest_point = rest_point(&rest, 0, "raw-sha", "2026-10-08T00:00:00Z").unwrap();
+        let rest_point = rest_point(&rest, "2026-10-08T00:00:00Z").unwrap();
         let ws: WsTrade = serde_json::from_slice(first_raw()).unwrap();
         let ws_point = ws_point(&ws, first_raw(), "2026-10-08T00:00:00Z").unwrap();
         assert!(same_trade(&rest_point, &ws_point));
         let mut changed = ws_point;
-        Arc::make_mut(&mut changed).quantity = "0.00300000".into();
+        changed.quantity = "0.00300000".into();
         assert!(!same_trade(&rest_point, &changed));
     }
 
@@ -1539,53 +1359,21 @@ mod tests {
         assert!(format!("{error:#}").contains("expected=5"));
     }
 
-    #[tokio::test]
-    async fn source_recovery_publishes_new_snapshot_on_same_subscription() {
-        let service = test_service(State::new());
-        let mut owner=(*service.state.load()).clone();
-        let mut subscription=service.subscribe();
-        service.invalidate(&mut owner, "source_read_failed").await;
-        let unavailable=service.event_frame(&subscription.recv().await.unwrap());
-        let trade:WsTrade=serde_json::from_slice(first_raw()).unwrap();
-        let point=ws_point(&trade,first_raw(),"2026-10-08T00:00:00Z").unwrap();
-        service.commit_snapshot(&mut owner, VecDeque::from([point]),"raw".into(),first_raw().to_vec()).await.unwrap();
-        let snapshot=service.event_frame(&subscription.recv().await.unwrap());
-        assert_eq!(snapshot["type"],"snapshot");
-        assert_eq!(snapshot["source_epoch"],unavailable["source_epoch"]);
-        assert_eq!(snapshot["stream_serial"].as_u64().unwrap(),unavailable["stream_serial"].as_u64().unwrap()+1);
-    }
-    #[tokio::test]
-    async fn held_snapshot_never_prevents_next_trade_and_events_do_not_queue_snapshots() {
-        let service=test_service(State::new());
-        let mut owner=State::new();
-        let a:WsTrade=serde_json::from_slice(first_raw()).unwrap();
-        let b:WsTrade=serde_json::from_slice(second_raw()).unwrap();
-        let first=ws_point(&a,first_raw(),"2026-10-08T00:00:00Z").unwrap();
-        let second=ws_point(&b,second_raw(),"2026-10-08T00:00:00Z").unwrap();
-        service.commit_snapshot(&mut owner,VecDeque::from([first]),"raw".into(),first_raw().to_vec()).await.unwrap();
-        let held=service.state.load();
-        let mut events=service.subscribe();
-        service.commit_trade(&mut owner,second,second_raw().to_vec(),"2026-10-08T00:00:00Z".into()).await.unwrap();
-        assert_eq!(held.last_id,Some(41));
-        assert_eq!(service.state.load().last_id,Some(42));
-        let event=events.recv().await.unwrap();
-        assert!(event.snapshot.is_none());
-        assert_eq!(service.event_frame(&event)["trade"]["trade_id"],42);
-    }
     #[test]
     fn archive_io_failure_retries_without_changing_live() {
         let root=tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("binance-trades"),b"blocking file").unwrap();
         let (tx,rx)=mpsc::channel(4);
-        let bytes=Arc::new(AtomicUsize::new(first_raw().len()*2));
+        let record=||Archive{epoch:"test".into(),trade_id:Some(41),received_at:"diagnostic".into(),trades:Vec::new(),raw:first_raw().to_vec()};
+        let bytes=Arc::new(AtomicUsize::new(record().owned_bytes()*2));
         let healthy=Arc::new(AtomicBool::new(true));let status=Arc::new(std::sync::Mutex::new(json!({})));
         let dir=root.path().to_owned();let b=bytes.clone();let h=healthy.clone();let s=status.clone();
         let worker=std::thread::spawn(move || archive_task(dir,rx,b,h,s));
-        tx.blocking_send(Archive{epoch:"test".into(),trade_id:Some(41),received_at:"diagnostic".into(),raw:first_raw().to_vec().into()}).unwrap();
+        tx.blocking_send(record()).unwrap();
         for _ in 0..100 {if !healthy.load(Ordering::Acquire){break}std::thread::sleep(Duration::from_millis(10));}
         assert_eq!(status.lock().unwrap()["state"],"failed_retrying");
         std::fs::remove_file(root.path().join("binance-trades")).unwrap();
-        tx.blocking_send(Archive{epoch:"test".into(),trade_id:Some(41),received_at:"diagnostic".into(),raw:first_raw().to_vec().into()}).unwrap();
+        tx.blocking_send(record()).unwrap();
         drop(tx);worker.join().unwrap();assert!(healthy.load(Ordering::Acquire));
         assert_eq!(bytes.load(Ordering::Acquire),0);
         assert_eq!(status.lock().unwrap()["last_success_trade_id"],41);

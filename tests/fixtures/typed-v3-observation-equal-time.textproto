@@ -1,0 +1,23 @@
+schema_version: "marketcow.btc-price-stream.v3"
+producer_instance_id: "fixture-producer"
+stream_id: "fixture-chainlink-generation-1"
+stream_sequence: 18
+source: CHAINLINK_BTC_USD_TWAP60
+instrument_id: "BTCUSD.CHAINLINK.TWAP60"
+source_sequence: 7
+published_at_ns: 1792023000000000000
+latest_source_age_ms_at_emit: 100
+observations {
+  observations {
+    source_time_ms: 1792022999900
+    price: "100.01"
+    source_sequence: 7
+    row_index: 0
+  }
+  observations {
+    source_time_ms: 1792022999900
+    price: "100.02"
+    source_sequence: 7
+    row_index: 1
+  }
+}

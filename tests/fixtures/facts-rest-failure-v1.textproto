@@ -1,0 +1,13 @@
+error { code: "upstream_rate_limited" retryable: true }
+request_id: "fixture-request-book"
+upstream {
+  url: "https://clob.polymarket.com/book?token_id=1"
+  status: 429
+  content_type: "text/plain"
+  retry_after: "2"
+  started_at_ns: 1792023000000000000
+  received_at_ns: 1792023000000100000
+  duration_us: 100
+  raw_body: "Too Many Requests"
+  body_complete: true
+}
