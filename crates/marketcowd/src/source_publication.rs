@@ -26,7 +26,7 @@ use crate::source_market_replay::{MarketPage, MarketReplay};
 use crate::source_market_persistence::{
     Limits as MarketPersistenceLimits, MarketDrainTimeout, MarketPersistence,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 const WS_STATE_CONFIRMATION_MIN_INTERVAL_MS: i64 = 1_000;
 pub(crate) const BTC5M_TRACE_SAMPLE_MODULUS: u64 = 4096;
@@ -239,7 +239,7 @@ fn prepare_projection_actions(
             let model = &event["canonical_payload"]["market"];
             let state_bytes = match event["canonical_payload"]["materialized_book_bytes"].as_u64() {
                 Some(declared) => usize::try_from(declared)?,
-                None => serde_json::to_vec(model)?.len(),
+                None => crate::source_snapshot::json_bytes(model)?,
             };
             actions.push(ProjectionAction::Terminal {
                 market_id: event["market_id"].as_str().context("terminal market identity")?.to_owned(),
@@ -260,7 +260,7 @@ fn prepare_projection_actions(
             .unwrap_or(&event["canonical_payload"]);
         let state_bytes = match event["canonical_payload"]["materialized_book_bytes"].as_u64() {
             Some(declared) => usize::try_from(declared)?,
-            None => serde_json::to_vec(model)?.len(),
+            None => crate::source_snapshot::json_bytes(model)?,
         };
         actions.push(ProjectionAction::Book {
             token_id, physical_cursor, exchange_at, clear_confirmation,
@@ -417,6 +417,7 @@ pub(super) struct MarketPublisher {
     persistence: Arc<MarketPersistence<Batch>>,
     health: Arc<MarketHealth>,
     catalog_bindings: BTreeMap<String, String>,
+    catalog_binding_bytes: usize,
     batch_cap: usize,
     confirmation_byte_limit: usize,
     // One-way for a stream epoch: after a disk admission gap, later groups
@@ -486,6 +487,10 @@ struct MarketHealth {
     source_ready: AtomicBool,
     accepting_events: AtomicBool,
     persistence_failed: AtomicBool,
+    // Set by the existing read surface before intake starts. Only standby
+    // admission reads it; normal market publication does not acquire a new
+    // shared lock or depend on a downstream socket.
+    ordinary_handoff_frame_bytes: AtomicUsize,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarketStreamWatermark {
@@ -498,6 +503,7 @@ pub struct MarketStreamWatermark {
 /// One selected market's books and replay boundary captured while holding only
 /// its market lane. It does not clone unrelated markets' depth or claim that
 /// the latest published books are already durable.
+#[derive(Clone)]
 pub struct MarketMemorySnapshot {
     pub watermark: MarketStreamWatermark,
     /// Last event in the selected market's published stream, including
@@ -506,6 +512,9 @@ pub struct MarketMemorySnapshot {
     pub last_market_event_cursor: u64,
     pub market: Option<Arc<Value>>,
     pub books: BTreeMap<String, Arc<Value>>,
+    /// Supplier trade clock, independent of the depth quote clock. A seed
+    /// may carry a last price without evidence of the trade's actual time.
+    pub trade_source_times: BTreeMap<String, String>,
     pub physical_book_cursors: BTreeMap<String, u64>,
     /// Cursor of the source event that installed this book. This is the
     /// recovery snapshot identity, not a physical archive offset and not the
@@ -530,6 +539,7 @@ struct MarketReadState {
     last_event_cursor: u64,
     market: Option<Arc<Value>>,
     books: BTreeMap<String, Arc<Value>>,
+    trade_source_times: BTreeMap<String, String>,
     book_exchanges: BTreeMap<String, DateTime<Utc>>,
     physical_book_cursors: BTreeMap<String, u64>,
     event_book_cursors: BTreeMap<String, u64>,
@@ -588,6 +598,7 @@ impl MarketReadState {
                         let token = token.as_str().context("terminal token identity")?;
                         ensure!(next.token_ids.contains(token), "terminal token outside market binding");
                         next.books.remove(token);
+                        next.trade_source_times.remove(token);
                         next.market_book_cursors.remove(token);
                         next.physical_book_cursors.remove(token);
                         next.event_book_cursors.remove(token);
@@ -614,6 +625,19 @@ impl MarketReadState {
                     }
                     if let Some(exchange_at) = exchange_at {
                         next.book_exchanges.insert(token_id.clone(), exchange_at);
+                    }
+                    if event["raw_payload"]["event_type"] == "last_trade_price" {
+                        if let Some(at) = event["exchange_at"].as_str() {
+                            DateTime::parse_from_rfc3339(at).context("supplier trade clock")?;
+                            next.trade_source_times.insert(token_id.clone(),at.to_owned());
+                        } else {
+                            next.trade_source_times.remove(&token_id);
+                        }
+                    } else if event["raw_payload"]["event_type"] == "book"
+                        || model["last_trade_price"].is_null() {
+                        // Full supplier seeds do not prove the last trade's
+                        // timestamp. Never assign their book timestamp to it.
+                        next.trade_source_times.remove(&token_id);
                     }
                     if clear_confirmation || next.books.get(&token_id).is_some_and(|old|
                         old["book_epoch"] != model["book_epoch"]
@@ -681,6 +705,12 @@ pub struct PublicReplay {
     pub confirmation_books: Vec<Arc<Value>>,
 }
 impl MemoryReader {
+    pub(crate) fn configure_ordinary_handoff_frame_bytes(&self, bytes: usize) -> Result<()> {
+        ensure!((4 * 1024..=2 * 1024 * 1024).contains(&bytes),
+            "ordinary handoff frame budget");
+        self.market_health.ordinary_handoff_frame_bytes.store(bytes,Ordering::Release);
+        Ok(())
+    }
     pub fn subscribe_market(&self, market_id: &str, stream_epoch: &str) -> Result<watch::Receiver<u64>> {
         self.market_replay.subscribe(market_id, stream_epoch)
     }
@@ -711,6 +741,7 @@ impl MemoryReader {
                 },
                 last_market_event_cursor: state.last_event_cursor,
                 market: state.market.clone(), books: selected(&state.books, token_ids),
+                trade_source_times: selected(&state.trade_source_times, token_ids),
                 physical_book_cursors: selected(&state.physical_book_cursors, token_ids),
                 event_book_cursors: selected(&state.event_book_cursors, token_ids),
                 market_book_cursors: selected(&state.market_book_cursors, token_ids),
@@ -1175,7 +1206,7 @@ impl Publication {
             );
             for book in state["books"].as_array().context("missing books")? {
                 let token = book["token_id"].as_str().context("token")?.to_owned();
-                state_sizes.insert((false, token.clone()), serde_json::to_vec(book)?.len());
+                state_sizes.insert((false, token.clone()), crate::source_snapshot::json_bytes(book)?);
                 book_exchanges.insert(
                     token.clone(),
                     chrono::DateTime::parse_from_rfc3339(
@@ -1197,7 +1228,7 @@ impl Publication {
                             .context("market")?
                             .into(),
                     ),
-                    serde_json::to_vec(market)?.len(),
+                    crate::source_snapshot::json_bytes(market)?,
                 );
                 markets.insert(
                     market["identity"]["market_id"]
@@ -1210,9 +1241,9 @@ impl Publication {
         }
         let state_bytes = base
             .as_ref()
-            .map(serde_json::to_vec)
+            .map(crate::source_snapshot::json_bytes)
             .transpose()?
-            .map_or(0, |v| v.len());
+            .unwrap_or(0);
         ensure!(
             state_bytes <= max_bytes.min(MAX_NON_QUEUE_STATE_BYTES),
             "initial memory state exceeds byte budget"
@@ -1344,6 +1375,7 @@ impl Publication {
             source_ready: AtomicBool::new(true),
             accepting_events: AtomicBool::new(true),
             persistence_failed: AtomicBool::new(false),
+            ordinary_handoff_frame_bytes: AtomicUsize::new(2 * 1024 * 1024),
         });
         let worker_health = market_health.clone();
         let retirement_queue = market_persistence.clone();
@@ -1632,6 +1664,7 @@ impl Publication {
                 market_publishers.insert(market.clone(), Arc::new(MarketPublisher {
                     market_id: market, gate: Mutex::new(()), replay: market_replay.clone(),
                     persistence: market_persistence.clone(), health: market_health.clone(),
+                    catalog_binding_bytes:crate::source_snapshot::json_bytes(&bindings)?,
                     catalog_bindings: bindings, batch_cap,
                     confirmation_byte_limit: max_bytes.min(MAX_NON_QUEUE_STATE_BYTES),
                     volatile: AtomicBool::new(false), volatile_groups: AtomicU64::new(0),
@@ -1709,7 +1742,7 @@ impl Publication {
         let mut m = self.memory.lock().unwrap();
         let cold_records = markets.iter().map(|id| {
             let record = m.markets.get(id).context("retirement cold catalog record missing")?;
-            ensure!(serde_json::to_vec(record.as_ref())?.len() <= 256 * 1024,
+            ensure!(crate::source_snapshot::json_bytes(record.as_ref())? <= 256 * 1024,
                 "retirement cold catalog record exceeds read budget");
             Ok((id.clone(), record.as_ref().clone()))
         }).collect::<Result<BTreeMap<_, _>>>()?;
@@ -1997,7 +2030,7 @@ impl Publication {
                 );
                 // Keep current typed lifecycle and metadata intact.
             } else {
-                let size = serde_json::to_vec(record)?.len();
+                let size = crate::source_snapshot::json_bytes(record)?;
                 state_bytes = state_bytes
                     .checked_add(size)
                     .context("admission size overflow")?;
@@ -2027,7 +2060,7 @@ impl Publication {
         let mut pending = self.pending_bindings.clone();
         pending.extend(additions.clone());
         ensure!(
-            serde_json::to_vec(&pending)?.len() <= self.batch_cap,
+            crate::source_snapshot::json_bytes(&pending)? <= self.batch_cap,
             "admitted binding byte capacity"
         );
         if check_only {
@@ -2062,15 +2095,16 @@ impl Publication {
                     current.market = Some(record.clone());
                 }
             })?;
-            let bindings = self.tokens.iter().filter(|(_, owner)| *owner == market)
+            let bindings:BTreeMap<String,String> = self.tokens.iter().filter(|(_, owner)| *owner == market)
                 .map(|(token, owner)| (token.clone(), owner.clone())).collect();
+            let catalog_binding_bytes=crate::source_snapshot::json_bytes(&bindings)?;
             self.market_publishers.write()
                 .map_err(|_| anyhow::anyhow!("market owner registry poisoned"))?
                 .entry(market.clone()).or_insert_with(|| Arc::new(MarketPublisher {
                     market_id: market.clone(), gate: Mutex::new(()),
                     replay: self.market_replay.clone(),
                     persistence: self.market_persistence.clone(),
-                    health: self.market_health.clone(), catalog_bindings: bindings,
+                    health: self.market_health.clone(), catalog_bindings: bindings, catalog_binding_bytes,
                     batch_cap: self.batch_cap,
                     confirmation_byte_limit: self.max_bytes.min(MAX_NON_QUEUE_STATE_BYTES),
                     volatile: AtomicBool::new(false), volatile_groups: AtomicU64::new(0),
@@ -2185,6 +2219,9 @@ impl Publication {
 }
 
 impl MarketPublisher {
+    pub(super) fn ordinary_handoff_frame_bytes(&self) -> usize {
+        self.health.ordinary_handoff_frame_bytes.load(Ordering::Acquire)
+    }
     pub(super) fn confirm_reduced_token(
         &self,
         market: &str,
@@ -2244,7 +2281,7 @@ impl MarketPublisher {
                 .context("market confirmation sequence overflow")?;
             next.market_confirmation_versions.insert(token.to_owned(), next.confirmation_sequence);
             next.confirmation_facts.insert(token.to_owned(), fact);
-            ensure!(serde_json::to_vec(&next.confirmation_facts)?.len() <= self.confirmation_byte_limit,
+            ensure!(crate::source_snapshot::json_bytes(&next.confirmation_facts)? <= self.confirmation_byte_limit,
                 "confirmation state byte budget exhausted");
             Ok((Some(Some(next)), true))
         })
@@ -2455,7 +2492,7 @@ impl Publication {
             next_state.confirmation_facts
                 .insert(token.clone(), Arc::new(fact));
         }
-        ensure!(serde_json::to_vec(&next_state.confirmation_facts)?.len()
+        ensure!(crate::source_snapshot::json_bytes(&next_state.confirmation_facts)?
             <= self.max_bytes.min(MAX_NON_QUEUE_STATE_BYTES),
             "confirmation state byte budget exhausted");
         Ok((Some(Some(next_state)), ConfirmationOutcome::Confirmed))
@@ -2603,9 +2640,20 @@ impl MarketPublisher {
         &self,
         validated: ValidatedSourceBatch,
         materialized_books: BTreeMap<u64, Value>,
+        prepared: PreparedProjection,
+        evidence: Option<Value>,
+        timing: Option<SourceBatchTiming>,
+    ) -> Result<Arc<Batch>> {
+        self.publish_before(validated,materialized_books,prepared,evidence,timing,None)
+    }
+    pub(super) fn publish_before(
+        &self,
+        validated: ValidatedSourceBatch,
+        materialized_books: BTreeMap<u64, Value>,
         mut prepared: PreparedProjection,
         evidence: Option<Value>,
         timing: Option<SourceBatchTiming>,
+        handoff_deadline: Option<DateTime<Utc>>,
     ) -> Result<Arc<Batch>> {
         let actor_events = validated.events();
         let market = actor_events.first().and_then(|event| event["market_id"].as_str())
@@ -2634,9 +2682,9 @@ impl MarketPublisher {
         validate_materialized_books(validated.events(), &materialized_books)?;
         let validated = validated.with_native_market_group(&stream_epoch, next_group)?;
         let catalog_bindings = self.catalog_bindings.clone();
-        let binding_bytes = serde_json::to_vec(&catalog_bindings)?.len();
-        let evidence_bytes = evidence.as_ref().map(serde_json::to_vec)
-            .transpose()?.map_or(0, |data| data.len());
+        let binding_bytes = self.catalog_binding_bytes;
+        let evidence_bytes = evidence.as_ref().map(crate::source_snapshot::json_bytes)
+            .transpose()?.unwrap_or(0);
         let materialized_bytes = materialized_declared_bytes(validated.events())?;
         let bytes = validated.encoded_bytes()
             .checked_add(materialized_bytes)
@@ -2673,8 +2721,13 @@ impl MarketPublisher {
             |state| {
                 ensure!(self.health.accepting_events.load(Ordering::Acquire),
                     "source acquisition paused");
-                state.as_ref().context("market projection absent")?
-                    .prepare_native_group(&market, next_group, batch.validated.events(), actions)
+                let next=state.as_ref().context("market projection absent")?
+                    .prepare_native_group(&market, next_group, batch.validated.events(), actions)?;
+                // This is the final fallible preparation under the selected
+                // market lane, before replay/state/persistence effects commit.
+                ensure!(handoff_deadline.is_none_or(|deadline|Utc::now()<deadline),
+                    "handoff supplier state expired before publication commit");
+                Ok(next)
             },
             |state, next| {
                 *state = Some(next);
@@ -2690,8 +2743,10 @@ impl MarketPublisher {
             // No writer owns this group's post-state. The live projection has
             // already installed its Arc; retaining a second writer-only copy
             // would unnecessarily consume the bounded replay allowance.
+            // Publication has already committed. Cleanup cannot turn a
+            // successful handoff into an ambiguous/rejected transaction.
             batch.materialized_books.lock()
-                .map_err(|_| anyhow::anyhow!("materialized books poisoned"))?.take();
+                .unwrap_or_else(|poisoned| poisoned.into_inner()).take();
             let count = self.volatile_groups.fetch_add(1, Ordering::AcqRel) + 1;
             if !was_volatile || count % 256 == 0 {
                 marketcow_polymarket::async_eprintln!("{}", json!({
@@ -2785,14 +2840,14 @@ impl Publication {
             .checked_add(if self.pending_bindings.is_empty() {
                 0
             } else {
-                serde_json::to_vec(&self.pending_bindings)?.len()
+                crate::source_snapshot::json_bytes(&self.pending_bindings)?
             })
             .context("binding byte overflow")?
             .checked_add(
                 evidence
-                    .map(serde_json::to_vec)
+                    .map(crate::source_snapshot::json_bytes)
                     .transpose()?
-                    .map_or(0, |value| value.len()),
+                    .unwrap_or(0),
             )
             .context("byte overflow")?
             .checked_add(materialized_declared_bytes(validated.events())?)
@@ -2857,7 +2912,7 @@ impl Publication {
                 apply_token_recovery(&mut recoveries, event)?;
             }
             ensure!(
-                serde_json::to_vec(&recoveries)?.len() <= self.batch_cap,
+                crate::source_snapshot::json_bytes(&recoveries)? <= self.batch_cap,
                 "recovery state byte cap"
             );
             Some(recoveries)

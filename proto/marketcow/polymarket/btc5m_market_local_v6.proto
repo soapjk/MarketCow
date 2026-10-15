@@ -1,0 +1,110 @@
+syntax = "proto3";
+package marketcow.polymarket.btc5m.v6;
+
+// Sole live contract: ordinary complete snapshots and absolute depth changes.
+// Upstream connection epochs, archive cursors and reconstruction are private.
+// One MarketFrame is ONE WebSocket binary message; no application chunking.
+message MarketKey {
+  string market_id = 1;
+  string condition_id = 2;
+  string window_id = 3;
+  string start_at = 4;
+  string end_at = 5;
+  string up_token_id = 6;
+  string down_token_id = 7;
+  bytes rule_sha256 = 8;
+}
+message PriceLevel { string price = 1; string size = 2; }
+message Trade {
+  string price = 1;
+  optional string source_at = 2; // Absent when the producer has no trade clock.
+}
+message Confirmation {
+  string source_at = 1;
+  string received_at = 2; // Diagnostic; never grants freshness.
+  string source = 3;
+  bytes evidence_sha256 = 4;
+  bytes bound_depth_sha256 = 5;
+  string bound_quote_source_at = 6;
+}
+// Every post_metadata is a COMPLETE replacement, NOT a patch. An absent
+// optional clears the old fact, including confirmation, trade and quote time.
+message TokenMetadata {
+  string token_id = 1;
+  string outcome = 2;
+  optional string tick_size = 3;
+  optional string quote_source_at = 4;
+  optional Trade last_trade = 5;
+  optional Confirmation confirmation = 6;
+  bool data_valid = 7; // Valid empty/one-sided depth is not an invalid baseline.
+  optional string invalid_reason = 8;
+  optional string received_at = 9; // Diagnostic only.
+}
+message TokenBook {
+  TokenMetadata metadata = 1;
+  repeated PriceLevel bids = 2; // Strict price-descending; positive sizes.
+  repeated PriceLevel asks = 3; // Strict price-ascending; positive sizes.
+}
+message Snapshot {
+  repeated TokenBook books = 1; // Exactly Up, Down; replace all old levels/facts.
+  string source_status = 2; // available, unavailable, waiting_baseline, ended.
+  optional string reason = 3;
+}
+message DepthChange {
+  string token_id = 1;
+  string side = 2; // BUY or SELL.
+  string price = 3;
+  string size = 4; // Absolute quantity; zero removes this level.
+}
+message PriceChange {
+  uint64 base_sequence = 1; // Must equal the recipient's last applied state.
+  repeated DepthChange changes = 2; // In encoded order, applied atomically.
+  repeated TokenMetadata post_metadata = 3; // Exactly Up, Down; complete facts.
+  string source_status = 4;
+  optional string reason = 5;
+}
+message MarketFrame {
+  string schema_version = 1; // marketcow.polymarket.btc5m.market-local.v6.
+  MarketKey key = 2;
+  string stream_id = 3; // Stable across A/B/C, recovery and next->current.
+  uint64 state_sequence = 4; // Producer state revision, not an archive cursor.
+  bytes state_sha256 = 5; // Commitment to the fully materialized POST state.
+  string published_at = 6; // Diagnostic only; excluded from state_sha256.
+  oneof body { Snapshot snapshot = 10; PriceChange price_change = 11; }
+}
+message DeliveryBudget {
+  uint64 maximum_frame_bytes = 1; // Producer hard bound 8388608.
+  uint64 maximum_state_bytes = 2; // Canonical state preimage bound 8388608.
+  uint64 maximum_levels_per_side = 3; // 10000 per token per side.
+  uint64 maximum_changes = 4; // 40000; greater net diff sends ordinary snapshot.
+}
+message MarketBinding {
+  MarketKey key = 1;
+  string role = 2; // Discovery only; changing role never resets the data stream.
+  string stream_id = 3;
+}
+message MarketStreams {
+  string schema_version = 1;
+  repeated MarketBinding markets = 2;
+  DeliveryBudget delivery_budget = 3;
+}
+
+// Decimals are exact normalized strings (0.30 -> 0.3); no float. No duplicate
+// levels, size>0 in snapshots, size>=0 in changes, BUY bids/SELL asks.
+// Canonical hashes are SHA256 of compact recursively lexicographically sorted
+// UTF-8 JSON, not protobuf bytes. The state preimage has exactly:
+// {schema_version,key,stream_id,state_sequence,books,source_status,reason}.
+// key uses all MarketKey fields, rule_sha256 as lowercase hex. books are Up,
+// Down; each has {metadata,bids,asks}; each level has {price,size}. metadata has
+// every TokenMetadata field; absent optionals are explicit JSON null. Trade
+// has {price,source_at}; Confirmation has all six fields, byte hashes as hex.
+// reason is always present in the preimage (null if absent).
+// Depth confirmation binding SHA preimage is {token_id,bids,asks,tick_size}.
+// Invalid confirmation facts are removed by the producer, never rebound.
+// Freshness derives ONLY from quote_source_at and exact confirmation.source_at.
+// No supplier time may be synthesized from receipt/publish/switch clocks.
+// Snapshots can jump to a later sequence; there is NO history replay promise.
+// Invalid/waiting/ended states use the SAME snapshot/price messages. They do
+// not demand HTTP reload, after_cursor, checkpoint handling or a ready barrier.
+// Never replace market identity in an existing subscription. Process restart
+// or true owner recreation gives a new stream_id and first ordinary snapshot.

@@ -293,24 +293,24 @@ impl DiscoveryConsumer {
         let book_bytes = view
             .books
             .iter()
-            .map(|(id, b)| Ok((id.clone(), serde_json::to_vec(b)?.len())))
+            .map(|(id, b)| Ok((id.clone(), crate::source_snapshot::json_bytes(b)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
         let market_bytes = view
             .markets
             .iter()
-            .map(|(id, m)| Ok((id.clone(), serde_json::to_vec(m)?.len())))
+            .map(|(id, m)| Ok((id.clone(), crate::source_snapshot::json_bytes(m)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
         let recovery_bytes = view
             .recoveries
             .iter()
-            .map(|(id, m)| Ok((id.clone(), serde_json::to_vec(m)?.len())))
+            .map(|(id, m)| Ok((id.clone(), crate::source_snapshot::json_bytes(m)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
         let state_bytes = book_bytes
             .values()
             .chain(market_bytes.values())
             .chain(recovery_bytes.values())
             .sum::<usize>()
-            + serde_json::to_vec(&view.base)?.len();
+            + crate::source_snapshot::json_bytes(&view.base)?;
         ensure!(
             state_bytes <= maximum_state_bytes,
             "consumer book state byte budget"
@@ -377,9 +377,9 @@ impl DiscoveryConsumer {
                     .view
                     .recoveries
                     .get(token)
-                    .map(serde_json::to_vec)
+                    .map(crate::source_snapshot::json_bytes)
                     .transpose()?
-                    .map_or(0, |v| v.len());
+                    .unwrap_or(0);
                 let next = self
                     .state_bytes
                     .checked_sub(self.recovery_bytes.get(token).copied().unwrap_or(0))
@@ -410,7 +410,7 @@ impl DiscoveryConsumer {
                                 && book["condition_id"] == event["condition_id"],
                             "book identity differs"
                         );
-                        let bytes = serde_json::to_vec(book)?.len();
+                        let bytes = crate::source_snapshot::json_bytes(book)?;
                         let next = self
                             .state_bytes
                             .checked_sub(self.book_bytes.get(token).copied().unwrap_or(0))
@@ -431,7 +431,7 @@ impl DiscoveryConsumer {
                             next["identity"] == market["identity"],
                             "terminal identity differs"
                         );
-                        let bytes = serde_json::to_vec(next)?.len();
+                        let bytes = crate::source_snapshot::json_bytes(next)?;
                         let total = self
                             .state_bytes
                             .checked_sub(self.market_bytes[id])

@@ -1,4 +1,4 @@
-//! Durable two-provider CTF finality quorum served by the unified MarketCow process.
+//! Durable CTF finality: two bounded parallel reads, at least one verified result.
 //!
 //! RPC endpoints stay in mode-0600 profile files. Provider reads are bounded and
 //! execute on the blocking pool, while publication is memory-first and disk
@@ -626,7 +626,8 @@ async fn verified(
     };
     {
         let state = shared.state.read().await;
-        if let Some(value) = state.durable_verified.get(&key) {
+        if let Some(value) = state.durable_verified.get(&key).filter(|value|
+            value["schema_version"] == "marketcow.polymarket.verified-final.v2") {
             if !matches!(
                 serde_json::to_vec(value),
                 Ok(encoded) if encoded.len() <= VERIFIED_RESPONSE_CAP
@@ -708,13 +709,10 @@ async fn verified(
         shared.config.request_timeout,
     );
     let (left, right) = tokio::join!(left, right);
-    let observations = match (left, right) {
-        (Ok(left), Ok(right)) => vec![left, right],
-        (left, right) => {
-            let observations = [left.ok(), right.ok()]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
+    // Join both bounded reads before committing. No detached late result can
+    // change an already published payout; failure of one provider is not a gate.
+    let observations = [left.ok(), right.ok()].into_iter().flatten().collect::<Vec<_>>();
+    if observations.is_empty() {
             let attempt_observed_at = timestamp();
             let fact = pending_fact(
                 &query,
@@ -736,8 +734,7 @@ async fn verified(
                 "provider_read_failed",
                 Some(first_observed_at),
             );
-        }
-    };
+    }
     let fact = match quorum_fact(&query, &key, &first_observed_at, &observations) {
         Ok(value) => value,
         Err(code) => {
@@ -757,7 +754,9 @@ async fn verified(
                     Some(first_observed_at),
                 );
             }
-            return failure(StatusCode::ACCEPTED, code, Some(first_observed_at));
+            return failure(if code == "finality_provider_disagreement" {
+                StatusCode::CONFLICT
+            } else { StatusCode::ACCEPTED }, code, Some(first_observed_at));
         }
     };
     match publish(&shared, key, fact).await {
@@ -930,9 +929,29 @@ fn quorum_fact(
     first_observed_at: &str,
     observations: &[Value],
 ) -> std::result::Result<Value, &'static str> {
-    if observations.len() != 2 || observations[0]["provider_id"] == observations[1]["provider_id"] {
-        return Err("independent_provider_quorum_required");
+    if observations.is_empty() || observations.len() > 2
+        || (observations.len() == 2 && observations[0]["provider_id"] == observations[1]["provider_id"]) {
+        return Err("valid_provider_observation_required");
     }
+    let mut last_invalid = "finality_observation_unresolved_or_invalid";
+    let observations = observations.iter().filter(|row| {
+        let value = &row["observation"];
+        if value["schema_version"] != "marketcow.polymarket.ctf-observation.v1"
+            || value["condition_id"] != query.condition_id
+            || value["status"] != "resolved_unverified"
+            || value["settlement_import_allowed"] != false
+            || value["standard_ctf_token_binding_verified"] != true
+        { return false; }
+        if validate_observation(value).is_err()
+            || row["observation_sha256"] != sha(&serde_json::to_vec(value).unwrap_or_default())
+        { last_invalid = "finality_observation_invalid"; return false; }
+        if !provider_identity_is_runtime_verified(row) {
+            last_invalid = "two_gateway_matching_observations";
+            return false;
+        }
+        true
+    }).cloned().collect::<Vec<_>>();
+    if observations.is_empty() { return Err(last_invalid); }
     let values = observations
         .iter()
         .map(|row| &row["observation"])
@@ -958,7 +977,7 @@ fn quorum_fact(
             "bound_tokens":value["bound_tokens"]
         })
     };
-    if agreement(values[0]) != agreement(values[1]) {
+    if values.len() == 2 && agreement(values[0]) != agreement(values[1]) {
         return Err("finality_provider_disagreement");
     }
     if !observations
@@ -986,10 +1005,10 @@ fn quorum_fact(
         })
         .collect::<Vec<_>>();
     let verified_at = timestamp();
-    validate_finality_timeline(first_observed_at, &verified_at, observations)
+    validate_finality_timeline(first_observed_at, &verified_at, &observations)
         .map_err(|_| "finality_observation_time_invalid")?;
     Ok(json!({
-        "schema_version":"marketcow.polymarket.verified-final.v1",
+        "schema_version":"marketcow.polymarket.verified-final.v2",
         "event_type":"polymarket_verified_final",
         "binding_key":key,
         "market_id":query.market_id,
@@ -1004,7 +1023,11 @@ fn quorum_fact(
         "ctf_address":values[0]["ctf_address"],
         "collateral":values[0]["collateral"],
         "status":"verified_final",
-        "finality_policy":"two_independent_operator_endpoints_finalized_receipts_v1",
+        "finality_policy":"parallel_two_endpoints_at_least_one_valid_finalized_no_conflict_v2",
+        "provider_reads_requested":2,
+        "provider_reads_completed_before_decision":true,
+        "valid_provider_count":observations.len(),
+        "decision_strategy":"wait_both_bounded_reads_no_late_commit",
         "identity_assurance":"registry_bound_https_operator_endpoints",
         "identity_assurance_boundary":"concrete upstream, cloud, region and physical host are not asserted",
         "first_observed_at":first_observed_at,
@@ -1109,11 +1132,15 @@ fn pending_fact(
 }
 
 fn validate_verified_fact(value: &Value) -> Result<()> {
+    // Existing immutable archive records are verified under their original
+    // assurance, never relabelled or served as new v2 receipts.
+    let historical = value["schema_version"] == "marketcow.polymarket.verified-final.v1";
     ensure!(
-        value["schema_version"] == "marketcow.polymarket.verified-final.v1"
+        (historical || value["schema_version"] == "marketcow.polymarket.verified-final.v2")
             && value["status"] == "verified_final"
             && value["finality_policy"]
-                == "two_independent_operator_endpoints_finalized_receipts_v1"
+                == if historical { "two_independent_operator_endpoints_finalized_receipts_v1" }
+                else { "parallel_two_endpoints_at_least_one_valid_finalized_no_conflict_v2" }
             && value["identity_assurance"] == "registry_bound_https_operator_endpoints"
             && value["settlement_import_allowed"] == true,
         "verified final schema"
@@ -1121,7 +1148,13 @@ fn validate_verified_fact(value: &Value) -> Result<()> {
     let observations = value["provider_observations"]
         .as_array()
         .context("verified observations")?;
-    ensure!(observations.len() == 2, "verified provider quorum");
+    ensure!(if historical { observations.len() == 2 }
+        else { (1..=2).contains(&observations.len())
+            && value["valid_provider_count"] == observations.len()
+            && value["provider_reads_requested"] == 2
+            && value["provider_reads_completed_before_decision"] == true
+            && value["decision_strategy"] == "wait_both_bounded_reads_no_late_commit" },
+        "verified provider count/policy");
     validate_finality_timeline(
         value["first_observed_at"]
             .as_str()
@@ -1142,6 +1175,20 @@ fn validate_verified_fact(value: &Value) -> Result<()> {
             "verified observation digest"
         );
         validate_observation(observation)?;
+    }
+    if !historical {
+        let query = FinalityQuery {
+            market_id: value["market_id"].as_str().context("market")?.to_owned(),
+            condition_id: value["condition_id"].as_str().context("condition")?.to_owned(),
+            up_token: value["ordered_outcomes"][0]["token_id"].as_str().context("up")?.to_owned(),
+            down_token: value["ordered_outcomes"][1]["token_id"].as_str().context("down")?.to_owned(),
+        };
+        let regenerated = quorum_fact(&query, value["binding_key"].as_str().context("binding")?,
+            value["first_observed_at"].as_str().context("first")?, observations)
+            .map_err(|code| anyhow::anyhow!(code))?;
+        ensure!(same_verified(value, &regenerated)
+            && value["provider_receipts"] == regenerated["provider_receipts"],
+            "verified payout/receipts mismatch");
     }
     Ok(())
 }
@@ -1455,7 +1502,7 @@ mod tests {
         assert!(validate_verified_fact(&inverted).is_err());
         assert_eq!(
             verified["finality_policy"],
-            "two_independent_operator_endpoints_finalized_receipts_v1"
+            "parallel_two_endpoints_at_least_one_valid_finalized_no_conflict_v2"
         );
         let gateway_left = provider_observation(0, &query, false);
         let gateway_right = provider_observation(1, &query, false);
@@ -1469,10 +1516,31 @@ mod tests {
             Err("two_gateway_matching_observations")
         );
         right["observation"]["payout_numerators"] = json!(["0", "1"]);
+        right["observation_sha256"] = json!(sha(&serde_json::to_vec(&right["observation"]).unwrap()));
+        right["provider_identity_evidence"]["observation_sha256"] = right["observation_sha256"].clone();
         assert_eq!(
             quorum_fact(&query, &key, "2026-01-01T00:00:00.000Z", &[left, right],),
             Err("finality_provider_disagreement")
         );
+    }
+
+    #[test]
+    fn single_valid_finality_and_invalid_peer_do_not_require_quorum() {
+        let query = query();
+        let key = validate_query(&query).unwrap().0;
+        let good = provider_observation(0, &query, true);
+        let single = quorum_fact(&query, &key, "2026-01-01T00:00:00.000Z", &[good.clone()]).unwrap();
+        assert_eq!(single["schema_version"], "marketcow.polymarket.verified-final.v2");
+        assert_eq!(single["valid_provider_count"], 1);
+        assert_eq!(single["provider_receipts"].as_array().unwrap().len(), 1);
+        validate_verified_fact(&single).unwrap();
+        let mut unresolved = provider_observation(1, &query, true);
+        unresolved["observation"]["status"] = json!("unresolved");
+        let fact = quorum_fact(&query, &key, "2026-01-01T00:00:00.000Z", &[good, unresolved]).unwrap();
+        assert_eq!(fact["valid_provider_count"], 1);
+        let mut tampered = fact;
+        tampered["provider_receipts"][0]["block_hash"] = json!("forged");
+        assert!(validate_verified_fact(&tampered).is_err());
     }
 
     #[test]

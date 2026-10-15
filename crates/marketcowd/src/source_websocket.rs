@@ -13,10 +13,16 @@ use marketcow_polymarket::{
     transport_output,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
 #[path = "source_websocket_pipeline.rs"]
 mod pipeline;
+
+#[derive(serde::Serialize)]
+struct DepthCommitment<'a> {
+    asks:&'a [Value],bids:&'a [Value],tick_size:String,token_id:&'a str,
+}
 
 // Every market socket owns a 2048-item/32-MiB FIFO. All socket FIFOs also share
 // these hard count/byte ceilings; more markets never multiply total retention.
@@ -141,6 +147,118 @@ struct ScopeAcquisition {
     retire_market_ids: BTreeSet<String>,
 }
 impl Adapter {
+    /// Reduce a standby prefix in a separate owner. The caller commits the
+    /// returned supplier prefix as ONE ordinary publication group before
+    /// replacing this adapter. The downstream receives its existing native
+    /// book/price/tick/trade messages, never a connection-switch envelope.
+    fn stage_connection_checkpoint(&self, frame: &RawTransportFrame, now: chrono::DateTime<Utc>)
+        -> Result<(Self, Vec<Value>)> {
+        let raw = &frame.raw_payload;
+        ensure!(raw["schema_version"] == "marketcow.polymarket.connection-checkpoint.v1",
+            "checkpoint schema");
+        ensure!(self.identities.len() == 2 && self.waiting.is_empty()
+            && self.recoveries.is_empty(), "checkpoint requires active complete market");
+        let tokens: BTreeSet<String> = serde_json::from_value(raw["token_ids"].clone())?;
+        ensure!(tokens == self.identities.keys().cloned().collect(), "checkpoint token binding");
+        let market = self.identities.values().next().context("checkpoint market")?.0.clone();
+        ensure!(self.identities.values().all(|(id, condition)|
+            id == &market && raw["market"].as_str() == Some(condition.as_str())),
+            "checkpoint condition binding");
+        let frames = raw["source_frames"].as_array().context("checkpoint source prefix")?;
+        ensure!(!frames.is_empty() && frames.len() <= marketcow_polymarket::MAX_CONNECTION_CHECKPOINT_FRAMES,
+            "checkpoint frame count");
+        ensure!(serde_json::to_vec(frame)?.len() <= marketcow_polymarket::MAX_CONNECTION_CHECKPOINT_BYTES,
+            "checkpoint byte budget");
+        // The internal handoff wrapper is transport-control evidence only.
+        // Preserve every real supplier preimage on the public path; never
+        // fabricate a supplier snapshot from the final materialized depth.
+        let mut staged = self.market_actor(&market);
+        staged.recoveries.clear();
+        let mut events = Vec::new();
+        let mut emitted_tokens = BTreeSet::new();
+        let mut retained_event_bytes = 0usize;
+        let mut previous_received = None;
+        for source in frames {
+            let received = chrono::DateTime::parse_from_rfc3339(
+                source["received_at"].as_str().context("checkpoint source receipt")?)?
+                .with_timezone(&Utc);
+            ensure!(previous_received.is_none_or(|previous| received >= previous)
+                && received <= frame.received_at, "checkpoint receipt order");
+            previous_received = Some(received);
+            let source_raw = source["raw_payload"].clone();
+            ensure!(source_raw.get("marketcow_conflation").is_none()
+                && matches!(source_raw["event_type"].as_str(),
+                    Some("book" | "price_change" | "last_trade_price" | "tick_size_change"
+                        | "best_bid_ask")), "checkpoint unsupported source boundary");
+            let affected = source_raw["asset_id"].as_str().map(str::to_owned)
+                .into_iter().chain(source_raw["price_changes"].as_array().into_iter()
+                    .flatten().filter_map(|change|change["asset_id"].as_str().map(str::to_owned)))
+                .collect::<BTreeSet<_>>();
+            ensure!(!affected.is_empty() && affected.is_subset(&tokens),
+                "checkpoint source token binding");
+            ensure!(source_raw["event_type"] == "book"
+                || affected.iter().all(|token| !staged.waiting.contains(token)),
+                "checkpoint delta before baseline");
+            // Direct apply propagates validation failures. apply_isolated's
+            // recovery fallback must not turn a bad candidate into a commit.
+            for event in staged.apply(source_raw, received, events.len() as u64)? {
+                ensure!(event["event_type"] == "book", "checkpoint non-book reduction");
+                ensure!(matches!(event["raw_payload"]["event_type"].as_str(),
+                    Some("book" | "price_change" | "tick_size_change" | "last_trade_price")),
+                    "handoff mutation has no existing ordinary wire representation");
+                emitted_tokens.insert(event["token_id"].as_str()
+                    .context("checkpoint event token")?.to_owned());
+                retained_event_bytes = retained_event_bytes.checked_add(serde_json::to_vec(&event)?.len())
+                    .context("handoff event bytes overflow")?;
+                ensure!(retained_event_bytes <= pipeline::OUTPUT_BYTES,
+                    "ordinary handoff prefix exceeds publication budget");
+                events.push(event);
+            }
+        }
+        ensure!(staged.waiting.is_empty() && emitted_tokens == tokens,
+            "checkpoint incomplete pair");
+        ensure!(previous_received == Some(frame.received_at), "checkpoint last receipt binding");
+        for token in &tokens {
+            let quote_at = *staged.book_source.get(token).context("checkpoint quote clock")?;
+            ensure!(self.book_source.get(token).is_none_or(|old|quote_at >= *old),
+                "checkpoint quote clock regression");
+            let verified_at = staged.confirmations.iter()
+                .filter(|fact| &fact.token_id == token
+                    && staged.depth_checksums.get(token) == Some(&fact.state_checksum)
+                    && staged.sequences.get(token) == Some(&fact.book_sequence))
+                .map(|fact|fact.exchange_at).max().unwrap_or(quote_at);
+            let age = now.signed_duration_since(verified_at).num_milliseconds();
+            ensure!((0..1500).contains(&age), "checkpoint candidate aged before commit");
+        }
+        // Only facts still bound to this final pair may be published after
+        // commit; the actor rechecks epoch/sequence/checksum independently.
+        Ok((staged, events))
+    }
+    /// A deadline from supplier quote/confirmation clocks only. Computing it
+    /// does not refresh a book or turn a local handoff receipt into evidence.
+    fn ordinary_handoff_deadline(&self, confirmations: &[ReducedBookConfirmation],
+        now: chrono::DateTime<Utc>) -> Result<chrono::DateTime<Utc>> {
+        ensure!(self.identities.len()==2 && self.waiting.is_empty()
+            && self.recoveries.is_empty(),"handoff final pair unavailable");
+        let mut deadline = None;
+        for (token,(market,condition)) in &self.identities {
+            let quote = *self.book_source.get(token).context("handoff quote clock absent")?;
+            let verified = confirmations.iter().filter(|fact|
+                &fact.token_id==token && &fact.market_id==market && &fact.condition_id==condition
+                && self.epochs.get(token)==Some(&fact.book_epoch)
+                && self.sequences.get(token)==Some(&fact.book_sequence)
+                && self.depth_checksums.get(token)==Some(&fact.state_checksum)
+                && self.book_received.get(token)==Some(&fact.book_received_at)
+                && fact.exchange_at>=quote && fact.exchange_at<=fact.received_at)
+                .map(|fact|fact.exchange_at).max().unwrap_or(quote);
+            ensure!(verified<=now,"handoff supplier clock is in the future");
+            let expires = verified.checked_add_signed(chrono::Duration::milliseconds(1500))
+                .context("handoff source deadline overflow")?;
+            ensure!(now<expires,"handoff aged during preparation");
+            deadline=Some(deadline.map_or(expires,|previous:chrono::DateTime<Utc>|previous.min(expires)));
+        }
+        deadline.context("handoff source deadline absent")
+    }
     /// The owner has already bound this exact identity to catalog metadata.
     /// New reducers start without tick/book/freshness state; snapshots must
     /// supply those facts. Retained pairs are never reset by admission.
@@ -933,9 +1051,8 @@ impl Adapter {
                 .collect();
             let at = wire_time(received)?;
             let event_source = wire_time(observed)?;
-            let checksum = canonical_hash(
-                &json!({"token_id":token,"tick_size":tick.0.to_string(),"bids":bids,"asks":asks}),
-            );
+            let checksum = hex::encode(Sha256::digest(serde_json::to_vec(&DepthCommitment {
+                asks:&asks,bids:&bids,tick_size:tick.0.to_string(),token_id:&token})?));
             if matches!(kind.as_str(), "price_change" | "best_bid_ask")
                 && self
                     .depth_checksums
@@ -988,16 +1105,24 @@ impl Adapter {
                 *sequence = sequence.checked_add(1).context("sequence overflow")?;
                 *sequence
             };
-            let model = json!({"token_id":token,"condition_id":condition,"book_epoch":self.epochs[&token],
+            let mut model = json!({"token_id":token,"condition_id":condition,"book_epoch":self.epochs[&token],
                 "sequence":sequence,"sequence_semantics":"deterministic_normalized","exchange_at":quote_source,
                 "received_at":book_at,"tick_version":book.tick_version,"tick_size":tick.0.to_string(),
-                "bids":bids,"asks":asks,"last_trade_price":self.last_trades.get(&token).map(|p|p.0.to_string()),
+                "bids":null,"asks":null,"last_trade_price":self.last_trades.get(&token).map(|p|p.0.to_string()),
                 "state_checksum":checksum,"source_hash":source_hash});
+            let fields=model.as_object_mut().expect("book object");
+            fields.insert("bids".into(),Value::Array(bids));
+            fields.insert("asks".into(),Value::Array(asks));
             let mut envelope = json!({"contract_version":"marketcow.prediction_market.v1","schema_version":"marketcow.polymarket.live.v2",
                 "cursor":after.checked_add(output.len() as u64+1).context("cursor overflow")?,"event_type":"book",
                 "market_id":market,"condition_id":condition,"token_id":token,"book_epoch":self.epochs[&token],"sequence":sequence,
-                "exchange_at":event_source,"received_at":at,"canonical_payload_sha256":canonical_hash(&model),"canonical_payload":model,
-                "raw_payload_sha256":canonical_hash(&raw),"raw_payload":raw,"applied":true,"fail_closed_reason":null,"gaps":[]});
+                "exchange_at":event_source,"received_at":at,"canonical_payload_sha256":canonical_hash(&model),"canonical_payload":null,
+                "raw_payload_sha256":canonical_hash(&raw),"raw_payload":null,"applied":true,"fail_closed_reason":null,"gaps":[]});
+            let fields=envelope.as_object_mut().expect("event object");
+            fields.insert("canonical_payload".into(),model);
+            // A supplier frame can normalize into several token events. Each
+            // legacy evidence envelope must retain that same complete frame.
+            fields.insert("raw_payload".into(),raw.clone());
             if kind == "price_change" {
                 let EventKind::AtomicDelta { changes, .. } = &applied.persisted.event.kind else {
                     anyhow::bail!("price change did not persist an atomic delta")
@@ -1400,6 +1525,242 @@ mod tests {
             received_at: at,
         }
     }
+
+    fn checkpoint_fixture(now: chrono::DateTime<Utc>) -> (Adapter, RawTransportFrame) {
+        let mut active = fixture();
+        let baseline_at = now - chrono::Duration::milliseconds(200);
+        for token in ["11","12"] {
+            active.apply_isolated(book(token,baseline_at),baseline_at,0).unwrap();
+        }
+        let standby_at = now - chrono::Duration::milliseconds(100);
+        let change = deep_change("7",now);
+        let frame = RawTransportFrame { received_at:now,raw_payload:json!({
+            "event_type":"marketcow_connection_checkpoint",
+            "schema_version":"marketcow.polymarket.connection-checkpoint.v1",
+            "market":"condition","token_ids":["11","12"],
+            "rotation_id":1,"attempt":1,"connection_id":"fixture-standby",
+            "source_frames":[
+                {"raw_payload":book("11",standby_at),"received_at":standby_at},
+                {"raw_payload":book("12",standby_at),"received_at":standby_at},
+                {"raw_payload":change.raw_payload,"received_at":change.received_at},
+            ]}) };
+        (active,frame)
+    }
+
+    #[test]
+    fn connection_checkpoint_commits_complete_pair_without_gap_or_clock_fabrication() {
+        let now = Utc::now();
+        let (active,frame) = checkpoint_fixture(now);
+        let original = active.depth_checksums.clone();
+        let (staged,events) = active.stage_connection_checkpoint(&frame,now).unwrap();
+        assert_eq!(active.depth_checksums,original);
+        assert_eq!(events.len(),3);
+        assert!(events.iter().all(|event|event["event_type"] == "book"
+            && event["gaps"] == json!([])
+            && matches!(event["raw_payload"]["event_type"].as_str(),Some("book"|"price_change"))));
+        assert_eq!(events[0]["raw_payload"],frame.raw_payload["source_frames"][0]["raw_payload"]);
+        assert_eq!(events[1]["raw_payload"],frame.raw_payload["source_frames"][1]["raw_payload"]);
+        assert_eq!(events[2]["raw_payload"],frame.raw_payload["source_frames"][2]["raw_payload"]);
+        assert!(staged.waiting.is_empty());
+        assert_ne!(staged.depth_checksums["11"],active.depth_checksums["11"]);
+        assert_eq!(staged.depth_checksums["12"],active.depth_checksums["12"]);
+        let bindings = [("11".into(),"1".into()),("12".into(),"1".into())].into();
+        marketcow_runtime::discovery_source::ValidatedSourceBatch::new_handoff(
+            events,0,&bindings,16*1024*1024).unwrap();
+    }
+
+    #[test]
+    fn invalid_or_aged_checkpoint_does_not_mutate_active_owner() {
+        let now = Utc::now();
+        let (active,mut frame) = checkpoint_fixture(now);
+        let original = active.depth_checksums.clone();
+        frame.raw_payload["source_frames"][2]["raw_payload"]["market"] = json!("wrong");
+        assert!(active.stage_connection_checkpoint(&frame,now).is_err());
+        assert_eq!(active.depth_checksums,original);
+        let (_,frame) = checkpoint_fixture(now);
+        assert!(active.stage_connection_checkpoint(&frame,now+chrono::Duration::seconds(2)).is_err());
+        assert_eq!(active.depth_checksums,original);
+    }
+
+    #[test]
+    fn incomplete_or_out_of_order_checkpoint_is_rejected() {
+        let now = Utc::now();
+        let (active,mut frame) = checkpoint_fixture(now);
+        frame.raw_payload["source_frames"].as_array_mut().unwrap().remove(1);
+        assert!(active.stage_connection_checkpoint(&frame,now).is_err());
+        let (_,mut frame) = checkpoint_fixture(now);
+        frame.raw_payload["source_frames"].as_array_mut().unwrap().swap(0,2);
+        assert!(active.stage_connection_checkpoint(&frame,now).is_err());
+    }
+
+    #[test]
+    fn ordinary_handoff_rechecks_final_age_without_receipt_refresh() {
+        // The supplier fixture serializes Unix milliseconds, not local ns.
+        // Compare deadlines in that exact source clock domain.
+        let now=chrono::DateTime::<Utc>::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
+        let (active,frame)=checkpoint_fixture(now);
+        let (mut staged,_)=active.stage_connection_checkpoint(&frame,now).unwrap();
+        let expected=now+chrono::Duration::milliseconds(1400);
+        assert_eq!(staged.ordinary_handoff_deadline(&[],now).unwrap(),expected);
+        assert!(staged.ordinary_handoff_deadline(&[],expected).is_err());
+        for receipt in staged.book_received.values_mut(){*receipt=now+chrono::Duration::seconds(10);}
+        assert!(staged.ordinary_handoff_deadline(&[],expected).is_err());
+    }
+    #[test]
+    fn ordinary_handoff_only_exact_source_confirmation_can_extend_deadline() {
+        let now=Utc::now();
+        let (active,frame)=checkpoint_fixture(now);
+        let (mut staged,_)=active.stage_connection_checkpoint(&frame,now).unwrap();
+        for quote in staged.book_source.values_mut(){*quote=now-chrono::Duration::seconds(10);}
+        assert!(staged.ordinary_handoff_deadline(&[],now).is_err());
+        let mut facts=staged.identities.iter().map(|(token,(market,condition))|
+            ReducedBookConfirmation{market_id:market.clone(),condition_id:condition.clone(),
+                token_id:token.clone(),book_epoch:staged.epochs[token].clone(),
+                book_sequence:staged.sequences[token],book_received_at:staged.book_received[token],
+                state_checksum:staged.depth_checksums[token].clone(),
+                exchange_at:now-chrono::Duration::milliseconds(10),received_at:now,
+                source_hash:"source-proof".into()}).collect::<Vec<_>>();
+        assert_eq!(staged.ordinary_handoff_deadline(&facts,now).unwrap(),
+            now+chrono::Duration::milliseconds(1490));
+        facts[0].book_sequence+=1;
+        assert!(staged.ordinary_handoff_deadline(&facts,now).is_err());
+    }
+    #[test]
+    fn ordinary_handoff_uses_existing_snapshot_delta_serializer() {
+        use chrono::TimeZone;
+        use marketcow_contracts::btc5m_market_local_v5::wire;
+        let now = Utc.timestamp_millis_opt(1_791_550_800_500).single().unwrap();
+        let (mut active,mut frame) = checkpoint_fixture(now);
+        let condition = format!("0x{}","1".repeat(64));
+        for (_,bound) in active.identities.values_mut() { *bound = condition.clone(); }
+        frame.raw_payload["market"] = json!(condition);
+        for source in frame.raw_payload["source_frames"].as_array_mut().unwrap() {
+            source["raw_payload"]["market"] = json!(condition);
+        }
+        let (_,events) = active.stage_connection_checkpoint(&frame,now).unwrap();
+        let (events,_) = pipeline::compact_incremental_events(events).unwrap();
+        let identity = wire::MarketIdentity {market_id:"1".into(),condition_id:condition,
+            profile_id:"2".repeat(64),profile_revision:1,profile_epoch:"3".repeat(32),
+            stream_epoch:Some("4".repeat(32))};
+        let group_hash = marketcow_runtime::discovery_source::market_group_hash(
+            "1","44444444444444444444444444444444",1,&events).unwrap();
+        let frames = crate::source_btc5m_proto::encode_market_group(
+            &identity,1,&group_hash,&events,65536).unwrap();
+        for event in &events {
+            assert!(matches!(crate::source_btc5m_proto::market_event(event).unwrap().payload,
+                Some(wire::market_event::Payload::BookSnapshot(_) | wire::market_event::Payload::BookDelta(_))));
+        }
+        let vector = json!({
+            "schema_version":"marketcow.polymarket.ordinary-handoff-vector.v1",
+            "source_events":events,"group_sha256":group_hash,
+            "frames_hex":frames.iter().map(hex::encode).collect::<Vec<_>>()
+        });
+        assert_eq!(vector["source_events"].as_array().unwrap().len(),3);
+        assert!(!frames.is_empty());
+    }
+    #[test]
+    fn ordinary_handoff_preserves_single_sided_books_and_trade_clock() {
+        use chrono::TimeZone;
+        use marketcow_contracts::btc5m_market_local_v5::wire;
+        let now = Utc.timestamp_millis_opt(1_791_550_800_500).single().unwrap();
+        let (mut active,mut frame) = checkpoint_fixture(now);
+        let condition = format!("0x{}","1".repeat(64));
+        for (_,bound) in active.identities.values_mut() { *bound = condition.clone(); }
+        frame.raw_payload["market"] = json!(condition);
+        let source = frame.raw_payload["source_frames"].as_array_mut().unwrap();
+        source.truncate(2);
+        for source in source.iter_mut() { source["raw_payload"]["market"] = json!(condition); }
+        source[0]["raw_payload"]["asks"] = json!([]);
+        source[0]["raw_payload"]["last_trade_price"] = json!("0.50");
+        source[1]["raw_payload"]["bids"] = json!([]);
+        source.push(json!({"raw_payload":{"event_type":"last_trade_price","market":condition,
+            "asset_id":"11","price":"0.52","timestamp":now.timestamp_millis().to_string()},
+            "received_at":now}));
+        let (_,events) = active.stage_connection_checkpoint(&frame,now).unwrap();
+        assert_eq!(events[2]["sequence"],2);
+        assert_eq!(events[1]["sequence"],1);
+        assert_eq!(events[0]["canonical_payload"]["asks"],json!([]));
+        assert_eq!(events[1]["canonical_payload"]["bids"],json!([]));
+        assert_eq!(events[2]["canonical_payload"]["last_trade_price"],"0.52");
+        assert_eq!(events[2]["canonical_payload"]["exchange_at"],wire_time(now-chrono::Duration::milliseconds(100)).unwrap());
+        assert_eq!(events[2]["canonical_payload"]["source_hash"],
+            canonical_hash(&frame.raw_payload["source_frames"][2]["raw_payload"]));
+        let (events,_) = pipeline::compact_incremental_events(events).unwrap();
+        let identity = wire::MarketIdentity {market_id:"1".into(),condition_id:condition,
+            profile_id:"2".repeat(64),profile_revision:1,profile_epoch:"3".repeat(32),
+            stream_epoch:Some("4".repeat(32))};
+        let group_hash = marketcow_runtime::discovery_source::market_group_hash(
+            "1","44444444444444444444444444444444",1,&events).unwrap();
+        let frames = crate::source_btc5m_proto::encode_market_group(
+            &identity,1,&group_hash,&events,4096).unwrap();
+        let vector = json!({"schema_version":"marketcow.polymarket.connection-checkpoint-single-sided-vector.v1",
+            "source_events":events,"group_sha256":group_hash,
+            "frames_hex":frames.iter().map(hex::encode).collect::<Vec<_>>()});
+        assert_eq!(vector["source_events"].as_array().unwrap().len(),3);
+        assert!(!frames.is_empty());
+    }
+    #[test]
+    fn ordinary_handoff_preserves_mixed_supplier_frames_and_complete_final_pair() {
+        use chrono::TimeZone;
+        use marketcow_contracts::btc5m_market_local_v5::wire;
+        let now = Utc.timestamp_millis_opt(1_791_550_800_500).single().unwrap();
+        let (mut active,mut frame) = checkpoint_fixture(now);
+        let condition = format!("0x{}","1".repeat(64));
+        for (_,bound) in active.identities.values_mut() { *bound = condition.clone(); }
+        frame.raw_payload["market"] = json!(condition);
+        let source = frame.raw_payload["source_frames"].as_array_mut().unwrap();
+        for source in source.iter_mut() { source["raw_payload"]["market"] = json!(condition); }
+        source[2]["raw_payload"]["timestamp"] = json!((now.timestamp_millis()-50).to_string());
+        source[2]["received_at"] = json!(now-chrono::Duration::milliseconds(50));
+        for (offset,raw) in [
+            (40,json!({"event_type":"tick_size_change","asset_id":"11","market":condition,
+                "old_tick_size":"0.01","new_tick_size":"0.02"})),
+            (30,json!({"event_type":"last_trade_price","asset_id":"11","market":condition,"price":"0.52"})),
+            (20,json!({"event_type":"price_change","market":condition,"price_changes":[
+                {"asset_id":"11","side":"BUY","price":"0.40","size":"8","best_bid":"0.4","best_ask":"0.6"},
+                {"asset_id":"12","side":"SELL","price":"0.60","size":"9","best_bid":"0.4","best_ask":"0.6"}]})),
+        ] {
+            let at = now-chrono::Duration::milliseconds(offset);
+            let mut raw = raw;
+            raw["timestamp"] = json!(at.timestamp_millis().to_string());
+            source.push(json!({"raw_payload":raw,"received_at":at}));
+        }
+        frame.received_at = now-chrono::Duration::milliseconds(20);
+        let (_,events) = active.stage_connection_checkpoint(&frame,now).unwrap();
+        let up = events.iter().rev().find(|event|event["token_id"]=="11").unwrap();
+        let down = events.iter().rev().find(|event|event["token_id"]=="12").unwrap();
+        assert_eq!(up["canonical_payload"]["tick_size"],"0.02");
+        assert_eq!(up["canonical_payload"]["last_trade_price"],"0.52");
+        assert_eq!(up["sequence"],5);
+        assert_eq!(down["sequence"],2);
+        let (events,_) = pipeline::compact_incremental_events(events).unwrap();
+        let identity = wire::MarketIdentity {market_id:"1".into(),condition_id:condition,
+            profile_id:"2".repeat(64),profile_revision:1,profile_epoch:"3".repeat(32),
+            stream_epoch:Some("4".repeat(32))};
+        let group_hash = marketcow_runtime::discovery_source::market_group_hash(
+            "1","44444444444444444444444444444444",1,&events).unwrap();
+        let frames = crate::source_btc5m_proto::encode_market_group(
+            &identity,1,&group_hash,&events,4096).unwrap();
+        let mut negative = Vec::new();
+        for code in ["missing_down_baseline","wrong_condition","source_clock_regression","off_tick_trade","last_receipt_mismatch"] {
+            let mut bad = frame.clone();
+            match code {
+                "missing_down_baseline" => {bad.raw_payload["source_frames"].as_array_mut().unwrap().remove(1);},
+                "wrong_condition" => bad.raw_payload["source_frames"][5]["raw_payload"]["market"] = json!("wrong"),
+                "source_clock_regression" => bad.raw_payload["source_frames"][5]["raw_payload"]["timestamp"] = json!((now.timestamp_millis()-1000).to_string()),
+                "off_tick_trade" => bad.raw_payload["source_frames"][4]["raw_payload"]["price"] = json!("0.51"),
+                _ => bad.received_at = now,
+            }
+            assert!(active.stage_connection_checkpoint(&bad,now).is_err(),"{code}");
+            negative.push(json!({"case":code,"raw_transport_frame":bad,"expected":"reject_entire_candidate"}));
+        }
+        let vector = json!({"schema_version":"marketcow.polymarket.connection-checkpoint-extended-vector.v1",
+            "source_events":events,"group_sha256":group_hash,
+            "frames_hex":frames.iter().map(hex::encode).collect::<Vec<_>>(),"negative_cases":negative});
+        assert_eq!(vector["negative_cases"].as_array().unwrap().len(),5);
+        assert!(vector["source_events"].as_array().unwrap().iter().all(|event|
+            event["raw_payload"]["event_type"] != "marketcow_connection_checkpoint"));
+    }
     fn paired_deep_change(size: &str, at: chrono::DateTime<Utc>) -> RawTransportFrame {
         RawTransportFrame {
             raw_payload: json!({"event_type":"price_change","market":"condition",
@@ -1444,7 +1805,7 @@ mod tests {
         for event in &compact {
             let typed = crate::source_btc5m_proto::market_event(event).unwrap();
             assert!(matches!(typed.payload,
-                Some(marketcow_contracts::btc5m_market_local_v3::wire::market_event::Payload::BookDelta(_))));
+                Some(marketcow_contracts::btc5m_market_local_v5::wire::market_event::Payload::BookDelta(_))));
         }
         assert!(conflated.apply_isolated(last.raw_payload, last.received_at, 4).unwrap().is_empty());
     }
@@ -1555,7 +1916,7 @@ mod tests {
         let compact = compact_btc5m_fixture_events(actual.clone()).unwrap();
         let typed = crate::source_btc5m_proto::market_event(&compact[0]).unwrap();
         assert!(matches!(typed.payload,
-            Some(marketcow_contracts::btc5m_market_local_v3::wire::market_event::Payload::BookDelta(_))));
+            Some(marketcow_contracts::btc5m_market_local_v5::wire::market_event::Payload::BookDelta(_))));
         assert_eq!(typed.raw_payload_sha256,
             hex::decode(compact[0]["raw_payload_sha256"].as_str().unwrap()).unwrap());
         assert_eq!(typed.event_id,
@@ -3722,7 +4083,7 @@ async fn run_connection(
                 batches.push(batch);
             }
             let mut routed = std::collections::VecDeque::new();
-            for batch in batches {
+            for mut batch in batches {
                 let source_tokens = batch.source_tokens();
                 if source_tokens.is_empty() { continue; }
                 if !source_tokens.is_subset(&acquisition_tokens) { continue; }
@@ -3746,10 +4107,19 @@ async fn run_connection(
                 dwell.1 = dwell.1.saturating_add(u128::from(dwell_us));
                 dwell.2 = dwell.2.max(dwell_us);
                 dwell.3 += u64::from(dwell_us >= 100_000);
+                let handoff_receipt = batch.take_handoff_receipt();
                 let frames = batch.into_frames().into_iter().filter(|frame|
                     marketcow_polymarket::subscription::owned_or_unclassified(
                         &frame.raw_payload, &acquisition_tokens))
-                    .collect();
+                    .collect::<Vec<_>>();
+                if let Some(receipt) = handoff_receipt {
+                    // Earlier A inputs must enter this market's FIFO before
+                    // its checkpoint. New B inputs cannot enter until commit.
+                    pipeline.submit_routed_batches(adapter, publication,
+                        routed.drain(..).collect()).await?;
+                    pipeline.submit_connection_checkpoint(adapter, market, frames, receipt)?;
+                    continue;
+                }
                 for segment in split_transport_control_boundaries(frames) {
                     routed.push_back((market.clone(), segment));
                 }

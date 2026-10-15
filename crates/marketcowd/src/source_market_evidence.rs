@@ -11,11 +11,8 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
-use tokio::sync::{Mutex, Semaphore};
+use std::{sync::Arc, time::Duration};
+use tokio::sync::Semaphore;
 const CAP: usize = 262144;
 pub fn project(id: &str, condition: &str, raw: &[u8], observed: &str) -> Result<Value> {
     ensure!(raw.len() <= CAP, "response_size_exceeded");
@@ -89,7 +86,6 @@ pub fn project(id: &str, condition: &str, raw: &[u8], observed: &str) -> Result<
 struct Service {
     client: reqwest::Client,
     slots: Arc<Semaphore>,
-    last: Arc<Mutex<Option<Instant>>>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -170,7 +166,6 @@ pub fn router() -> Result<Router> {
                 .retry(reqwest::retry::never())
                 .build()?,
             slots: Arc::new(Semaphore::new(1)),
-            last: Arc::new(Mutex::new(None)),
         }))
 }
 fn decimal(v: &Value, name: &str, allow_zero: bool) -> Result<String> {
@@ -295,13 +290,6 @@ async fn read_execution(
     let Ok(_slot) = s.slots.try_acquire() else {
         return failure(StatusCode::TOO_MANY_REQUESTS, "busy");
     };
-    {
-        let mut last = s.last.lock().await;
-        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
-            return failure(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
-        };
-        *last = Some(Instant::now());
-    }
     let url = format!(
         "https://clob.polymarket.com/clob-markets/{}",
         q.expected_condition_id
@@ -314,6 +302,8 @@ async fn read_execution(
             .await
             .map_err(|_| "transport_failed")?;
         let status = response.status().as_u16();
+        let retry_after = response.headers().get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()).map(str::to_owned);
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| "body_failed")? {
             if chunk.len() > CAP - body.len() {
@@ -325,7 +315,7 @@ async fn read_execution(
         if status != 200 {
             return Ok(
                 json!({"schema_version":"marketcow.polymarket.market-evidence-rejection.v1",
-            "upstream_status":status,"source_url":url,"observed_at":observed,"raw_complete":true,
+            "upstream_status":status,"upstream_retry_after":retry_after,"source_url":url,"observed_at":observed,"raw_complete":true,
             "raw_bytes":body.len(),"raw_sha256":hex::encode(Sha256::digest(&body)),"raw_base64":STANDARD.encode(body)}),
             );
         }
@@ -358,13 +348,6 @@ async fn read_slug(
     let Ok(_slot) = s.slots.try_acquire() else {
         return failure(StatusCode::TOO_MANY_REQUESTS, "busy");
     };
-    {
-        let mut last = s.last.lock().await;
-        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
-            return failure(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
-        };
-        *last = Some(Instant::now());
-    }
     let operation = async {
         let mut response = s
             .client
@@ -373,6 +356,8 @@ async fn read_slug(
             .await
             .map_err(|_| "transport_failed")?;
         let status = response.status().as_u16();
+        let retry_after = response.headers().get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()).map(str::to_owned);
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| "body_failed")? {
             if chunk.len() > CAP - body.len() {
@@ -384,7 +369,7 @@ async fn read_slug(
         if status != 200 {
             return Ok(
                 json!({"schema_version":"marketcow.polymarket.market-evidence-rejection.v1",
-            "upstream_status":status,"source_url":url,"observed_at":observed,"raw_complete":true,
+            "upstream_status":status,"upstream_retry_after":retry_after,"source_url":url,"observed_at":observed,"raw_complete":true,
             "raw_bytes":body.len(),"raw_sha256":hex::encode(Sha256::digest(&body)),"raw_base64":STANDARD.encode(body)}),
             );
         }
@@ -424,13 +409,6 @@ async fn read(
     let Ok(_slot) = s.slots.try_acquire() else {
         return failure(StatusCode::TOO_MANY_REQUESTS, "busy");
     };
-    {
-        let mut last = s.last.lock().await;
-        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
-            return failure(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
-        };
-        *last = Some(Instant::now());
-    }
     let operation = async {
         let mut response = s
             .client
@@ -442,6 +420,8 @@ async fn read(
             .await
             .map_err(|_| "transport_failed")?;
         let status = response.status().as_u16();
+        let retry_after = response.headers().get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()).map(str::to_owned);
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| "body_failed")? {
             if chunk.len() > CAP - body.len() {
@@ -452,7 +432,7 @@ async fn read(
         let observed = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         if status != 200 {
             return Ok(
-                json!({"schema_version":"marketcow.polymarket.market-evidence-rejection.v1","upstream_status":status,"market_id":q.market_id,"observed_at":observed,"raw_complete":true,"raw_bytes":body.len(),"raw_sha256":hex::encode(Sha256::digest(&body)),"raw_base64":STANDARD.encode(body)}),
+                json!({"schema_version":"marketcow.polymarket.market-evidence-rejection.v1","upstream_status":status,"upstream_retry_after":retry_after,"market_id":q.market_id,"observed_at":observed,"raw_complete":true,"raw_bytes":body.len(),"raw_sha256":hex::encode(Sha256::digest(&body)),"raw_base64":STANDARD.encode(body)}),
             );
         }
         project(&q.market_id, &q.expected_condition_id, &body, &observed)
@@ -467,6 +447,41 @@ async fn read(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn sequential_read_surfaces_have_no_shared_interval_gate() {
+        // Closed loopback proxy makes upstream attempts fail immediately;
+        // no supplier network or timing sleeps are needed for this regression.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let service = Service {
+            client: reqwest::Client::builder()
+                .proxy(reqwest::Proxy::all(format!("http://{address}")).unwrap())
+                .timeout(Duration::from_secs(1)).build().unwrap(),
+            slots: Arc::new(Semaphore::new(1)),
+        };
+        let condition = format!("0x{}", "33".repeat(32));
+        let first = read(State(service.clone()), Ok(Query(Request {
+            market_id: "600001".into(), expected_condition_id: condition.clone(),
+        }))).await;
+        assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+        let second = read_execution(State(service.clone()), Ok(Query(ExecutionRequest {
+            market_id: "600001".into(), expected_condition_id: condition,
+            expected_up_token: "10001".into(), expected_down_token: "10002".into(),
+        }))).await;
+        assert_eq!(second.status(), StatusCode::BAD_GATEWAY);
+        let third = read_slug(State(service.clone()), Ok(Query(SlugRequest {
+            slug: "bitcoin-up-or-down-october-10-2026-1am-et".into(),
+        }))).await;
+        assert_eq!(third.status(), StatusCode::BAD_GATEWAY);
+        // Concurrency remains bounded and is not converted into a wait queue.
+        let held = service.slots.acquire().await.unwrap();
+        let busy = read(State(service.clone()), Ok(Query(Request {
+            market_id: "600001".into(), expected_condition_id: format!("0x{}", "33".repeat(32)),
+        }))).await;
+        assert_eq!(busy.status(), StatusCode::TOO_MANY_REQUESTS);
+        drop(held);
+    }
     fn raw() -> Value {
         json!({"id":"1","conditionId":"c","clobTokenIds":"[\"10\",\"20\"]","outcomes":"[\"Yes\",\"No\"]","question":"synthetic","description":"synthetic full rules","closed":true,"outcomePrices":"[\"1\",\"0\"]"})
     }

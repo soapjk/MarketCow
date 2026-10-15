@@ -1,0 +1,561 @@
+syntax = "proto3";
+
+package marketcow.polymarket.btc5m.v5;
+
+// MarketCow -> Tradude BTC five-minute market-local contract, version 5.
+// Quote/trade freshness is exclusively supplier-clock time. Local receive,
+// publish and apply clocks are diagnostic and never renew a quote.
+// Hot snapshots and streams do not expose persistence progress as a trading
+// gate. Only separate replay APIs report durable archive bounds.
+// This is the only high-frequency feed. A consumer MUST reject another schema
+// version; there is no implicit JSON/global-cursor compatibility mode.
+// All uint64 cursors are positive after the first event; zero means the empty
+// prefix only where explicitly allowed. Every optional scalar uses proto3
+// presence: absent is different from zero or the empty string.
+
+message MarketIdentity {
+  string market_id = 1;                 // Nonempty decimal Polymarket ID.
+  string condition_id = 2;              // 0x-prefixed, 32-byte lowercase hex.
+  string profile_id = 3;                // SHA-256 hex of the fixed profile.
+  uint64 profile_revision = 4;
+  string profile_epoch = 5;             // 32 lowercase hex; changes on publish.
+  optional string stream_epoch = 6;     // Absent only before publication.
+}
+
+message OutcomeBinding {
+  string outcome = 1;                   // Exactly Up or Down.
+  string token_id = 2;                  // Nonempty decimal Polymarket ID.
+}
+
+message MarketBinding {
+  MarketIdentity identity = 1;
+  string role = 2;                      // current, next or retiring.
+  string window_id = 3;
+  string start_at = 4;                  // RFC3339 UTC with microseconds.
+  string end_at = 5;
+  repeated OutcomeBinding outcomes = 6; // Exactly Up, Down in this order.
+  bytes rule_sha256 = 7;               // Exactly 32 bytes.
+  uint64 maximum_quote_age_ms = 8;
+}
+
+message MarketWatermark {
+  MarketIdentity identity = 1;
+  optional uint64 published_market_cursor = 2; // Zero is explicit empty prefix.
+  optional uint64 replay_floor_market_cursor = 3;
+  optional uint64 last_market_event_cursor = 4; // Event prefix, NOT resume.
+  optional uint64 confirmation_sequence = 5;   // Memory-only, independent.
+}
+
+message PriceLevel {
+  string price = 1;                     // Canonical decimal, no float.
+  string size = 2;
+}
+
+message CanonicalBook {
+  string token_id = 1;
+  string condition_id = 2;
+  string book_epoch = 3;
+  uint64 sequence = 4;
+  string sequence_semantics = 5;
+  string quote_source_at = 6;          // Required supplier book timestamp, RFC3339 UTC.
+  string received_at = 7;              // Local receipt; diagnostic only.
+  bytes tick_version = 8;               // SHA-256 of the tick-size fact.
+  string tick_size = 9;
+  repeated PriceLevel bids = 10;       // Strict descending price; no duplicate.
+  repeated PriceLevel asks = 11;       // Strict ascending price; no duplicate.
+  optional string last_trade_price = 12;
+  bytes state_checksum = 13;           // Exactly 32 bytes.
+  optional string source_hash = 14;    // Venue hash, not a raw SHA alias.
+}
+
+message DepthChange {
+  string token_id = 1;
+  string side = 2;                      // BUY or SELL.
+  string price = 3;
+  string size = 4;                      // Zero deletes the level.
+}
+
+message BookPostState {
+  string token_id = 1;
+  string condition_id = 2;
+  string book_epoch = 3;
+  uint64 sequence = 4;
+  string sequence_semantics = 5;
+  string quote_source_at = 6;          // Supplier book timestamp; not trade time.
+  string received_at = 7;              // Local receipt; diagnostic only.
+  bytes tick_version = 8;
+  string tick_size = 9;
+  optional string last_trade_price = 10;
+  bytes state_checksum = 11;
+  optional string source_hash = 12;
+  bytes canonical_book_sha256 = 13;    // Full materialized post-book commitment.
+  uint64 materialized_book_bytes = 14; // Canonical JSON book byte length.
+}
+
+message BookDelta {
+  repeated DepthChange changes = 1;    // Apply in encoded order, atomically.
+  BookPostState post_state = 2;
+}
+
+message LastTrade {
+  string price = 1;
+  BookPostState post_state = 2;         // Depth unchanged; quote clock does not advance.
+  string trade_source_at = 3;          // Required supplier trade timestamp.
+  string trade_received_at = 4;
+}
+
+message RecoveryStarted {
+  string recovery_id = 1;
+  string recovery_scope = 2;           // token or market.
+  repeated string affected_token_ids = 3;
+  string reason = 4;
+}
+
+message RecoveryCompleted {
+  string recovery_id = 1;
+  string recovery_scope = 2;
+  // MARKET EVENT cursor of the authoritative snapshot. Never a group or
+  // physical archive cursor; it must have been applied in this stream epoch.
+  uint64 snapshot_cursor = 3;
+  repeated string resolved_gap_token_ids = 4;
+}
+
+message RecoveryState {
+  string token_id = 1;
+  string recovery_id = 2;
+  string gap_code = 3;
+  string gap_detected_at = 4;
+  optional uint64 snapshot_cursor = 5; // Market event cursor, if observed.
+}
+
+message SourceGap {
+  string token_id = 1;
+  string code = 2;
+  string reason = 3;
+}
+
+message Terminal {
+  string reason = 1;
+  repeated string retired_token_ids = 2;
+  string lifecycle_state = 3;
+  optional string winning_outcome = 4;
+  string terminal_at = 5;
+  bytes lifecycle_evidence_sha256 = 6;
+  bytes metadata_revision_sha256 = 7;
+}
+
+message MarketEvent {
+  // Contiguous within one stream_epoch. A group may contain multiple events;
+  // this is not an after_cursor for group replay.
+  uint64 market_event_cursor = 1;
+  bytes event_id = 2;                   // Producer's 32-byte semantic commitment.
+  bytes raw_payload_sha256 = 3;        // Source preimage commitment. A conflated
+                                       // price_change embeds every exact supplier
+                                       // frame under marketcow_conflation.source_frames.
+  bytes canonical_payload_sha256 = 4;  // MarketCow canonical event commitment.
+  string market_id = 5;
+  string condition_id = 6;
+  optional string token_id = 7;
+  optional string book_epoch = 8;
+  optional uint64 book_sequence = 9;
+  optional string source_at = 10;     // Supplier event time on book events; absent for internal boundaries.
+  string received_at = 11;             // Local receipt; diagnostic only.
+  optional bool applied = 12;
+  optional string fail_closed_reason = 13;
+  optional uint64 physical_archive_cursor = 14; // Absent on live WS; present only in durable replay.
+  // REQUIRED nonempty canonical JSON of the complete versioned MarketCow
+  // source event with only its top-level event_id member removed. This includes
+  // raw_payload and canonical_payload. The consumer MUST verify canonical
+  // encoding, event_id=SHA256(these bytes), both payload hashes from the
+  // corresponding parsed members, and agreement with the typed fields before
+  // applying. This is an audit preimage inside the sole protobuf feed, not a
+  // parallel JSON feed. physical_archive_cursor is excluded: assigned later.
+  bytes source_event_preimage_json = 15;
+  oneof payload {
+    CanonicalBook book_snapshot = 20;
+    // Derived dual-book handoff. Verify the exact source_frames in the
+    // source_event_preimage_json before accepting this complete book.
+    CanonicalBook connection_checkpoint_book = 27;
+    BookDelta book_delta = 21;
+    LastTrade last_trade = 22;
+    RecoveryStarted recovery_started = 23;
+    RecoveryCompleted recovery_completed = 24;
+    SourceGap source_gap = 25;
+    Terminal terminal = 26;
+  }
+}
+
+message BookConfirmation {
+  string token_id = 1;
+  string condition_id = 2;
+  uint64 confirmation_sequence = 3;
+  uint64 book_market_cursor = 4;       // Group containing current book mutation.
+  string book_epoch = 5;
+  uint64 book_sequence = 6;
+  bytes state_checksum = 7;
+  string book_quote_source_at = 8;     // Supplier time of the bound canonical book.
+  string confirmation_source_at = 9;   // Supplier time of this exact observation.
+  string confirmation_source = 10;
+  bytes confirmation_evidence_sha256 = 11;
+  string confirmation_received_at = 12; // Local receipt; diagnostic only.
+}
+
+message BookBaseline {
+  reserved 9;
+  string outcome = 1;
+  string token_id = 2;
+  optional bool replay_baseline_valid = 3;
+  optional uint64 book_market_cursor = 4;
+  optional uint64 book_market_event_cursor = 5;
+  optional bytes canonical_book_sha256 = 6;
+  optional CanonicalBook canonical_book = 7;
+  optional RecoveryState active_recovery = 8;
+  optional BookConfirmation confirmation = 10;
+}
+
+message MarketFullSync {
+  MarketBinding binding = 1;
+  MarketWatermark watermark = 2;
+  repeated BookBaseline books = 3;     // Exactly the binding's two tokens.
+  optional string market_unavailable_reason = 4;
+  bool snapshot_is_not_execution_readiness = 5; // MUST be true.
+}
+
+message MarketStreams {
+  string profile_id = 1;
+  uint64 profile_revision = 2;
+  string profile_epoch = 3;
+  repeated MarketBinding markets = 4;
+  repeated MarketWatermark watermarks = 5; // Only published markets; join by market_id.
+  LiveDeliveryBudget live_delivery_budget = 6; // Required, all values positive.
+}
+
+message LiveDeliveryBudget {
+  uint64 maximum_frame_bytes = 1;
+  uint64 maximum_group_encoded_bytes = 2;
+  uint64 maximum_checkpoint_encoded_bytes = 3;
+  uint64 backlog_groups = 4;
+  uint64 backlog_age_ms = 5; // Source publish-monotonic age, not quote age.
+  uint64 minimum_checkpoint_interval_ms = 6; // Fixed protocol scheduling bound 250.
+  uint64 maximum_connection_checkpoint_frames = 7; // 8192, not conflation's 64.
+  uint64 maximum_connection_checkpoint_bytes = 8; // 8389632: canonical JSON raw_payload after seed enrichment.
+  uint64 maximum_checkpoint_chunk_count = 9; // ceil(maximum_checkpoint_encoded_bytes/(maximum_frame_bytes-512)).
+}
+
+message MarketStreamRequest {
+  // Logical request model. The existing HTTP WebSocket upgrade carries these
+  // same fields as explicit URL query parameters. The cursor parameter is
+  // exactly after_market_cursor; after_cursor is not an accepted alias.
+  // Stream response is Binary MarketStreamFrame under subprotocol
+  // marketcow.btc5m.market-local.v5.
+  MarketIdentity identity = 1;
+  optional uint64 after_market_cursor = 2; // Explicit zero is valid.
+  optional uint64 after_confirmation_sequence = 3; // Independent prefix.
+}
+
+message MarketReplayGroup {
+  uint64 market_cursor = 1;
+  bytes group_sha256 = 2;
+  repeated MarketEvent events = 3;
+}
+
+message MarketReplayPage {
+  string market_id = 1;
+  string stream_epoch = 2;
+  optional MarketIdentity active_identity = 3; // Absent on cold archive read.
+  optional uint64 after_market_cursor = 4; // Exclusive; zero valid.
+  optional uint64 next_market_cursor = 5;  // Last complete returned group.
+  optional uint64 replay_floor_market_cursor = 6;
+  optional uint64 durable_market_cursor = 7;
+  optional uint64 published_market_cursor = 8; // Only on hot read.
+  bool caught_up = 9; // Only to this archive's durable prefix, never live.
+  bool archive_only = 10;
+  repeated MarketReplayGroup groups = 11;
+}
+
+// Both hot market-replay and cold market-archive-replay HTTP queries use
+// market_id, stream_epoch, after_market_cursor, maximum_groups. Their
+// Replay durable watermarks are market-group cursors; physical archive
+// positions remain separate optional evidence on each durable event.
+
+message MarketGroupBegin {
+  uint64 market_cursor = 1;
+  bytes group_sha256 = 2;
+  uint32 event_count = 3;
+  uint32 chunk_count = 4;
+  uint64 encoded_bytes = 5; // MarketEventBundle, required >0, maximum 32 MiB.
+}
+
+message MarketEventBundle { repeated MarketEvent events = 1; }
+
+message MarketGroupChunk {
+  uint64 market_cursor = 1;
+  bytes group_sha256 = 2;
+  uint32 chunk_index = 3;              // Zero based, strictly contiguous.
+  uint32 chunk_count = 4;
+  reserved 5; // v3's event-boundary chunks are not a v5 compatibility path.
+  bytes encoded_events_part = 6; // Contiguous bytes of ONE MarketEventBundle.
+}
+
+message MarketGroupCommit {
+  uint64 market_cursor = 1;
+  bytes group_sha256 = 2;
+  uint32 event_count = 3;
+  uint32 chunk_count = 4;
+  uint64 next_after_market_cursor = 5; // Equal to market_cursor.
+}
+
+message MarketReady {
+  // The producer freezes one complete-group prefix at stream admission.
+  // Ready follows delivery of that prefix; it need not wait for a liquid
+  // market to stop publishing. Newer groups follow ready in FIFO order.
+  optional uint64 market_cursor = 1;   // Zero valid if no group yet.
+  optional uint64 last_market_event_cursor = 2;
+  optional uint64 confirmation_sequence = 3;
+  // Complete current-book confirmation fact set at this sequence. Empty is
+  // meaningful and MUST clear superseded facts atomically before ready=true.
+  repeated BookConfirmation confirmations = 4;
+  optional bool execution_readiness = 5; // MUST be present and false.
+}
+
+message BookConfirmations {
+  optional uint64 sent_market_cursor = 1; // Zero valid.
+  uint64 confirmation_sequence = 2;   // Strictly increases after ready.
+  // May be empty when every new fact was superseded by a later book before
+  // delivery. Empty advances only the confirmation prefix; it never refreshes
+  // a book or creates execution evidence.
+  repeated BookConfirmation confirmations = 3;
+  // Memory-only freshness. Never mutates canonical book, group cursor or
+  // archive state; older book identities are ignored, not rebound.
+}
+
+message MarketUnavailable {
+  optional uint64 after_market_cursor = 1; // Zero valid.
+  string reason = 2;
+  bool requires_new_market_full_sync = 3; // MUST be true.
+}
+
+message ProfileChanged {
+  optional uint64 after_market_cursor = 1; // Zero valid.
+  string next_profile_id = 2;
+  uint64 next_profile_revision = 3;
+  string next_profile_epoch = 4;
+  bool requires_new_market_full_sync = 5; // MUST be true.
+}
+
+// A slow live reader may replace an obsolete prefix at a COMPLETE group
+// boundary without disconnecting. This is latest-state delivery, not complete
+// event history. Archive replay is separate. Never apply half a checkpoint.
+message LiveCheckpoint {
+  MarketFullSync snapshot = 1;
+  uint64 replaces_after_market_cursor = 2;
+  uint64 last_market_event_cursor = 3;
+  string reason = 4; // live_backlog or replay_expired.
+  bytes semantic_preimage_json = 5;
+  bytes semantic_sha256 = 6; // SHA256(canonical JSON preimage), NOT proto bytes.
+}
+message CheckpointBegin {
+  string checkpoint_id = 1;
+  uint64 replaces_after_market_cursor = 2;
+  uint64 market_cursor = 3;
+  uint32 chunk_count = 4;
+  uint64 encoded_bytes = 5;
+  bytes semantic_sha256 = 6;
+}
+message CheckpointChunk {
+  string checkpoint_id = 1;
+  uint32 chunk_index = 2; // Contiguous zero-based index.
+  bytes encoded_checkpoint_part = 3;
+}
+message CheckpointCommit {
+  string checkpoint_id = 1;
+  uint64 market_cursor = 2;
+  bytes semantic_sha256 = 3;
+}
+
+message MarketStreamFrame {
+  MarketIdentity identity = 1;
+  oneof body {
+    MarketGroupBegin group_begin = 10;
+    MarketGroupChunk group_chunk = 11;
+    MarketGroupCommit group_commit = 12;
+    MarketReady ready = 13;
+    BookConfirmations book_confirmations = 14;
+    MarketUnavailable unavailable = 16;
+    ProfileChanged profile_changed = 17;
+    CheckpointBegin checkpoint_begin = 18;
+    CheckpointChunk checkpoint_chunk = 19;
+    CheckpointCommit checkpoint_commit = 20;
+  }
+}
+
+message ArchiveEventLocation {
+  MarketIdentity identity = 1;
+  uint64 market_cursor = 2;
+  uint64 market_event_cursor = 3;
+  uint64 physical_archive_cursor = 4; // Only in durable archive evidence.
+  bytes event_id = 5;
+}
+
+// Hash contract (not protobuf wire bytes): existing MarketCow canonical JSON
+// uses recursively lexicographically sorted UTF-8 keys, compact separators,
+// unescaped UTF-8, integer cursors in base 10, no floats, then SHA-256.
+// raw_payload_sha256 is SHA256(canonical_json(raw_payload)). For an ordinary
+// event raw_payload is one supplier JSON frame; for a depth-conflated event it
+// is a MarketCow aggregate containing all supplier frames and receipt clocks.
+// A consumer seeing marketcow_conflation MUST verify its version, 2..64 exact
+// source frames, source_frame_count, first/last receipt clocks, common market
+// and token, unchanged BBO, and final last-write-wins depth assignments. It
+// must not interpret the synthetic outer raw payload as a supplier WS frame.
+// canonical_payload_sha256 is SHA256(canonical_json(the event's canonical
+// MarketCow payload)); event_id is SHA256(canonical_json(the versioned source
+// envelope with its event_id member removed)). These hashes commit producer
+// facts. source_event_preimage_json makes all three producer commitments
+// independently recomputable. The full canonical book hash and checksum are
+// independently checked against the typed materialized book. group_sha256
+// preimage is exactly:
+// {"event_ids":[lowercase-hex event_id in event order],
+//  "market_cursor":uint64,"market_id":string,
+//  "schema_version":"marketcow.polymarket.market-group.v2",
+//  "stream_epoch":string}
+// with keys serialized in the shown sorted order and no whitespace. Event ID,
+// raw and canonical payload commitments retain their separately versioned
+// MarketCow semantic preimages; consumers MUST NOT hash protobuf bytes or use
+// physical_archive_cursor as a market-event or group cursor. A semantic hash
+// algorithm change requires its own schema revision and fixed producer vector.
+//
+// A stream_epoch is born with group/event cursors zero, and is invalidated by
+// market retirement/re-admission, rebuild or restart. A new profile_epoch
+// invalidates all prior role bindings. No cursor, confirmation sequence or
+// in-flight group may cross either epoch. On partial-group disconnect, discard
+// the group and resume from the last *applied* complete market_cursor. Ready
+// requires both group and confirmation prefixes; no application control frame can appear
+// between begin and commit. Physical archive cursor is assigned asynchronously
+// after publication and never gates live delivery.
+
+// Connection checkpoint source preimage:
+// raw_payload.event_type=marketcow_connection_checkpoint,
+// schema_version=marketcow.polymarket.connection-checkpoint.v1. source_frames
+// preserves ordered exact raw_payload/received_at pairs, including both venue
+// full snapshots and every subsequently reduced message. token_ids is the
+// sorted pair. initial_tick_sizes is a normalized decimal map for exactly the
+// two tokens: the owner metadata seed actually used for independent reduction,
+// not a fresh supplier observation. Explicit venue tick metadata must validate
+// against the reducer rules; consumers must not infer the seed from old A.
+// A checkpoint book must equal independent reduction of that
+// prefix. No source_gap, artificial source timestamp or old-A delta is allowed
+// inside or after a successful handoff. Book epochs may change; stream epoch,
+// group/event cursors and downstream WS connection remain continuous.
+// LiveCheckpoint semantic JSON preimage has exactly schema_version,
+// market_id, stream_epoch, profile_epoch, replaces_after_market_cursor,
+// profile_id, profile_revision, binding (native MarketBinding JSON with
+// market/condition/role/window/outcomes/rule_sha256),
+// market_cursor, last_market_event_cursor, confirmation_sequence, reason,
+// books. books is binding outcome order, each object contains token_id,
+// canonical_book (native canonical JSON or null), canonical_book_sha256
+// (lowercase hex or null), book_market_cursor, book_market_event_cursor,
+// replay_baseline_valid, active_recovery (typed mapping below or null), confirmation
+// (native source-time-bound fact or null). Hash uses the canonical JSON rule
+// above. active_recovery has EXACTLY token_id, recovery_id, gap_code,
+// gap_detected_at, snapshot_cursor. Strings preserve RecoveryState values;
+// snapshot_cursor is its present uint64 or JSON null when absent. This is
+// constructed from the SAME typed RecoveryState used by snapshot.books, not
+// the richer native recovery/gap object; native diagnostic extras are not part
+// of this wire/hash commitment and cannot be silently assumed by the consumer.
+// The decoded snapshot MUST exactly match this semantic preimage and
+// active binding. Commit atomically replaces both books AND confirmation facts,
+// clears incomplete groups, acknowledges the covered event/group prefixes,
+// then accepts deltas after market_cursor. No receipt renews quote freshness.
+// All v5 group chunks use encoded_events_part. Concatenate bounded parts only
+// after checking begin count/encoded_bytes, decode ONE MarketEventBundle and
+// verify event_count, all source preimages/event IDs and group_sha256 before
+// atomic apply/ack. This permits large evidence-bearing events without an
+// oversized WS frame. Protobuf byte segmentation is never a hash algorithm.
+//
+// Bounds and framing (mandatory, no implicit consumer defaults):
+// connection source_frames has 1..8192 entries, in receive order; the producer
+// rejects a serialized RawTransportFrame over 8388608 bytes before evidence
+// seed enrichment. The delivered derived raw_payload, including seed metadata,
+// is <= maximum_connection_checkpoint_bytes (8389632 canonical JSON bytes).
+// Public source-event/group encoding also obeys the advertised
+// maximum_group_encoded_bytes (33554432). Checkpoint encoded_bytes is positive
+// and <= maximum_checkpoint_encoded_bytes (3 * configured snapshot byte cap).
+// Its chunk_count is positive, <= maximum_checkpoint_chunk_count, and exactly
+// ceil(encoded_bytes/(maximum_frame_bytes-512)); zero-based parts are contiguous,
+// non-final parts have exactly maximum_frame_bytes-512 bytes, final part is
+// positive and <= that bound. Their total equals encoded_bytes. Same id/hash,
+// identity and market_cursor bind begin and commit. No application data/control frame may
+// interleave a checkpoint, nor may checkpoint start inside an unfinished group.
+// WebSocket protocol Ping/Pong/Close are not application frames; heartbeats
+// remain serviceable while staging parts and must not discard staged material.
+// replaces_after_market_cursor is exactly this connection's last completely
+// sent group or committed replacement, not merely its initially requested
+// cursor. On the consumer it must equal the last atomically applied boundary.
+// Snapshot published_market_cursor equals begin/commit.market_cursor and is
+// strictly greater; snapshot.last_market_event_cursor equals the committed
+// LiveCheckpoint event prefix, and all per-book cursors are <= those prefixes.
+//
+// Independent connection-prefix reduction:
+// 1. Use empty books/duplicate state and initial_tick_sizes for both tokens.
+//    Every token requires a native full book before any non-book message for it.
+//    Walk source_frames in array order; never sort by supplier timestamp. Within
+//    price_changes validate every entry, group tokens lexicographically, keep
+//    final absolute assignment per normalized token/side/price; all items for
+//    one token must agree on supplied BBO (both present or both absent).
+// 2. Full book replaces all levels, sets or clears last_trade_price as supplied,
+//    establishes epoch SHA256(canonical JSON {connection_snapshot_cursor,
+//    received_at,source_hash,token_id}). connection_snapshot_cursor is one plus
+//    the zero-based emitted-book position WITHIN THIS raw frame, because each
+//    prefix apply starts after=0. received_at truncates to microseconds, UTC Z,
+//    six fractional digits unless fractional part is zero (then no fraction);
+//    source_hash is canonical SHA256 of this unwrapped native raw_payload.
+//    Reset sequence to zero, then emit sequence 1; repeated full snapshots reset
+//    epoch/sequence again. Decimal prices/sizes normalize (no trailing zeroes),
+//    bids descending, asks ascending; zero size deletes a price level.
+// 3. price_change applies its ordered absolute level quantities, not quantity
+//    additions. A new non-duplicate observation with unchanged depth emits no
+//    mutation/sequence, only a separately bound confirmation. A mutation bumps
+//    sequence once per normalized token event and updates quote source/receipt.
+//    last_trade_price updates last_trade only; tick_size_change validates and
+//    updates tick/version, normalizes depth through the maintained reducer;
+//    full-book tick_version=SHA256(canonical JSON {tick_size:normalized string});
+//    changed tick_version=SHA256(canonical JSON {old_tick_size:normalized string
+//    or null,new_tick_size:normalized string,source_revision:raw canonical SHA});
+//    both emit a sequence mutation but do NOT advance quote_source_at. Tick
+//    changes update book receipt; last trade retains previous book receipt.
+//    best_bid_ask is an assertion/confirmation, not a full-depth replacement.
+// 4. Exact raw replays are idempotent, not confirmations. Use the maintained
+//    normalizer/reducer duplicate identity (same raw canonical SHA plus token
+//    within the same scope); keep the last 10000 accepted identities per token.
+//    Native supplier timestamps parse decimal Unix milliseconds; receipt order
+//    is nondecreasing and the last source receipt equals the wrapper receipt.
+//    The normalizer marks receipt-source >5000ms as diagnostic delayed, not a
+//    blanket live data-drop gate. Atomic delta older than the current quote or
+//    received before the authoritative full-book receipt is superseded (no new
+//    depth); delayed atomic delta at or before the current quote is likewise
+//    superseded. No-op assertions cannot make an older observation fresh.
+//    Trade/tick supplier clocks are separate from the quote clock. Bad
+//    token/condition, unsupported message, malformed/off-tick data, missing
+//    baseline, source-clock violation, or failure to reconstruct either token
+//    rejects the entire candidate; never partially apply it to active books.
+//    Quote clock is supplier book/changed-depth time, never receipt/trade/tick.
+//    Final candidate quote clock cannot regress relative to active A; latest
+//    bound supplier observation age must be >=0 and <1500ms at source commit.
+// 5. Keep the final canonical state for each token, sorted token order; the
+//    checkpoint group emits exactly this pair. Its canonical payload retains
+//    each original quote/book receipt clock. The derived envelope received_at
+//    is the prefix's last receipt and envelope source_at is final quote time.
+//    canonical_book.source_hash is the canonical SHA of the native raw frame
+//    that last EMITTED this token's materialized state (book, changed delta,
+//    tick or trade), not SHA of the connection wrapper and not necessarily
+//    the last source_frames entry. A no-op confirmation does not overwrite it.
+//    last_trade survives price/tick changes; full book explicitly sets/clears
+//    it, trade replaces it. A single-sided/empty depth is valid observational
+//    state and must not be rejected for missing executable BBO by this data
+//    contract. quote_source_at belongs to each token, not the whole batch:
+//    a multi-token delta advances only mutated tokens; unchanged tokens keep
+//    their quote clock and may acquire separately bound confirmation facts.
+//    Recompute all canonical/raw/event/group hashes against these preimages.
+//    A later normal delta continues that token's new epoch/sequence. Any old-A
+//    work admitted BEFORE the checkpoint is FIFO-before it; none admitted after
+//    acknowledged commit may mutate the new pair.

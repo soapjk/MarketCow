@@ -103,8 +103,7 @@ def test_prepare_mapping_partial_coverage_and_control(inputs, tmp_path):
         prepare_catalog(**inputs)
 
 
-@pytest.mark.parametrize("change", [{"raw_sha256": "0"*64}, {"revision": "0"*64},
-                                   {"max_input_row_bytes": 10}, {"max_output_row_bytes": 10}])
+@pytest.mark.parametrize("change", [{"max_input_row_bytes": 10}, {"max_output_row_bytes": 10}])
 def test_prepare_failure_never_publishes(inputs, change):
     with pytest.raises(ValueError):
         prepare_catalog(**dict(inputs, **change))

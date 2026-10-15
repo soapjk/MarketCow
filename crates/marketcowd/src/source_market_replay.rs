@@ -12,12 +12,13 @@ use anyhow::{Context, Result, ensure};
 use super::source_market_persistence::MarketCapacityExhausted;
 use marketcow_runtime::discovery_source::market_group_hash;
 use serde_json::Value;
+use arc_swap::ArcSwap;
 use tokio::sync::watch;
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicUsize, AtomicU64, Ordering},
     },
 };
 
@@ -43,6 +44,18 @@ pub struct MarketPage<T> {
     pub caught_up: bool,
 }
 
+#[derive(Debug)]
+pub struct MarketReplayGroupBudget {
+    pub bytes: usize,
+    pub limit: usize,
+}
+impl std::fmt::Display for MarketReplayGroupBudget {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f,"single market group exceeds page budget: {} > {}",self.bytes,self.limit)
+    }
+}
+impl std::error::Error for MarketReplayGroupBudget {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarketWatermark {
     pub market_id: String,
@@ -53,6 +66,7 @@ pub struct MarketWatermark {
 }
 
 struct Lane<T, S> {
+    revision: AtomicU64,
     state: S,
     epoch: String,
     retired: bool,
@@ -69,6 +83,7 @@ pub struct MarketReplay<T, S = ()> {
     // Registry mutations are rare. Hot publishing/replay locks only the
     // selected market; two unrelated markets never wait for one lane mutex.
     lanes: RwLock<BTreeMap<String, Arc<Mutex<Lane<T, S>>>>>,
+    read_views: RwLock<BTreeMap<String, Arc<ArcSwap<ReadView<S>>>>>,
     maximum_groups_per_market: usize,
     maximum_bytes_per_market: usize,
     maximum_total_bytes: usize,
@@ -83,6 +98,13 @@ pub struct MarketReplay<T, S = ()> {
     budget_lock: Mutex<()>,
     total_bytes: AtomicUsize,
     occupied_market_slots: AtomicUsize,
+}
+
+struct ReadView<S> {
+    state: S,
+    watermark: MarketWatermark,
+    retired: bool,
+    revision:u64,
 }
 
 /// Pending admissions consume aggregate capacity, but cannot donate proposed
@@ -135,7 +157,7 @@ impl<T> MarketReplay<T> {
     }
 }
 
-impl<T, S: Default> MarketReplay<T, S> {
+impl<T, S: Default + Clone> MarketReplay<T, S> {
     pub fn new_with_state(
         maximum_groups_per_market: usize,
         maximum_bytes_per_market: usize,
@@ -149,6 +171,7 @@ impl<T, S: Default> MarketReplay<T, S> {
         );
         Ok(Self {
             lanes: RwLock::new(BTreeMap::new()),
+            read_views: RwLock::new(BTreeMap::new()),
             maximum_groups_per_market,
             maximum_bytes_per_market,
             maximum_total_bytes,
@@ -186,6 +209,22 @@ impl<T, S: Default> MarketReplay<T, S> {
             .get(market_id)
             .cloned()
             .context("market replay not registered")
+    }
+
+    fn publish_view(&self, market: &str, lane: &Lane<T, S>) {
+        let view = Arc::new(ReadView {state:lane.state.clone(),retired:lane.retired,
+            revision:lane.revision.load(Ordering::Relaxed),
+            watermark:MarketWatermark {market_id:market.to_owned(),stream_epoch:lane.epoch.clone(),
+                published_cursor:lane.published,durable_cursor:lane.durable,replay_floor:lane.replay_floor}});
+        let existing = self.read_views.read().unwrap_or_else(|e|e.into_inner())
+            .get(market).cloned();
+        if let Some(existing) = existing { existing.store(view); }
+        else { self.read_views.write().unwrap_or_else(|e|e.into_inner())
+            .insert(market.to_owned(),Arc::new(ArcSwap::from(view))); }
+    }
+    fn publish_state_view(&self, market:&str,lane:&Lane<T,S>) {
+        lane.revision.fetch_add(1,Ordering::Relaxed);
+        self.publish_view(market,lane);
     }
 
     pub fn register(&self, market_id: &str, stream_epoch: &str) -> Result<()> {
@@ -232,6 +271,7 @@ impl<T, S: Default> MarketReplay<T, S> {
         lanes.insert(
             market_id.to_owned(),
             Arc::new(Mutex::new(Lane {
+                revision:AtomicU64::new(0),
                 state: S::default(),
                 epoch: stream_epoch.to_owned(),
                 retired: false,
@@ -272,6 +312,7 @@ impl<T, S: Default> MarketReplay<T, S> {
         lanes.insert(
             market_id.to_owned(),
             Arc::new(Mutex::new(Lane {
+                revision:AtomicU64::new(0),
                 state: S::default(),
                 epoch: stream_epoch.to_owned(),
                 retired: false,
@@ -387,10 +428,15 @@ impl<T, S: Default> MarketReplay<T, S> {
         ensure!(durable_charge >= bytes && durable_charge <= retained_charge,
             "invalid durable market replay charge");
         let lane_handle = self.lane(market_id)?;
+        let epoch={let lane=lane_handle.lock().map_err(|_|anyhow::anyhow!("market lane poisoned"))?;
+            lane.epoch.clone()};
+        // Required wire commitment is computed before the state critical section.
+        let group_sha256=market_group_hash(market_id,&epoch,expected_cursor,events)?;
         let mut lane = lane_handle
             .lock()
             .map_err(|_| anyhow::anyhow!("market lane poisoned"))?;
         ensure!(!lane.retired, "market replay retired");
+        ensure!(lane.epoch==epoch,"market replay epoch changed");
         ensure!(
             events.iter().all(|event| event["market_id"] == market_id),
             "cross-market observation group"
@@ -404,7 +450,6 @@ impl<T, S: Default> MarketReplay<T, S> {
             "market replay publication cursor differs"
         );
         let prepared = prepare(&lane.state)?;
-        let group_sha256 = market_group_hash(market_id, &lane.epoch, next, &events)?;
         ensure!(bytes > 0 && retained_charge >= bytes,
             "invalid market observation charge");
         if retained_charge > self.maximum_bytes_per_market {
@@ -525,6 +570,7 @@ impl<T, S: Default> MarketReplay<T, S> {
         reservation.commit();
         debug_assert!(self.total_bytes() <= self.maximum_total_bytes);
         commit(&mut lane.state, prepared);
+        self.publish_state_view(market_id, &lane);
         lane.changed.send_modify(|version| *version = version.wrapping_add(1));
         Ok(group)
     }
@@ -533,14 +579,11 @@ impl<T, S: Default> MarketReplay<T, S> {
     /// a global publication mutex or hold the directory while waiting for a lane.
     pub fn read_state<R>(&self, market_id: &str,
         read: impl FnOnce(&S, MarketWatermark) -> Result<R>) -> Result<R> {
-        let handle = self.lane(market_id)?;
-        let lane = handle.lock().map_err(|_| anyhow::anyhow!("market lane poisoned"))?;
-        ensure!(!lane.retired && lane.published > 0, "market not published");
-        read(&lane.state, MarketWatermark {
-            market_id: market_id.to_owned(), stream_epoch: lane.epoch.clone(),
-            published_cursor: lane.published, durable_cursor: lane.durable,
-            replay_floor: lane.replay_floor,
-        })
+        let published = self.read_views.read().map_err(|_|anyhow::anyhow!("market read directory poisoned"))?
+            .get(market_id).cloned().context("market not published")?;
+        let view = published.load_full();
+        ensure!(!view.retired && view.watermark.published_cursor > 0, "market not published");
+        read(&view.state, view.watermark.clone())
     }
 
     /// Memory-only projection updates (confirmation/control) use the same fence
@@ -551,6 +594,7 @@ impl<T, S: Default> MarketReplay<T, S> {
         let mut lane = handle.lock().map_err(|_| anyhow::anyhow!("market lane poisoned"))?;
         ensure!(!lane.retired, "market replay retired");
         update(&mut lane.state);
+        self.publish_state_view(market_id, &lane);
         lane.changed.send_modify(|version| *version = version.wrapping_add(1));
         Ok(())
     }
@@ -564,6 +608,7 @@ impl<T, S: Default> MarketReplay<T, S> {
         if let Some(handle) = handle {
             let mut lane = handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             lane.state = S::default();
+            self.publish_state_view(market_id, &lane);
             lane.changed.send_modify(|version| *version = version.wrapping_add(1));
         }
     }
@@ -573,6 +618,13 @@ impl<T, S: Default> MarketReplay<T, S> {
     /// The caller still serializes admission for this market, and the later
     /// publish transaction checks the expected group cursor again.
     pub fn inspect_lane<R>(&self, market_id: &str, inspect: impl FnOnce(&S, &MarketWatermark) -> Result<R>) -> Result<R> {
+        let published=self.read_views.read().map_err(|_|anyhow::anyhow!("market read directory poisoned"))?
+            .get(market_id).cloned();
+        if let Some(published)=published {
+            let view=published.load_full();
+            ensure!(!view.retired,"market replay retired");
+            return inspect(&view.state,&view.watermark);
+        }
         let handle = self.lane(market_id)?;
         let lane = handle.lock().map_err(|_| anyhow::anyhow!("market lane poisoned"))?;
         ensure!(!lane.retired, "market replay retired");
@@ -589,12 +641,21 @@ impl<T, S: Default> MarketReplay<T, S> {
     /// not wait for its validation or serialization.
     pub fn transition_state<R>(&self, market_id: &str,
         transition: impl FnOnce(&S) -> Result<(Option<S>, R)>) -> Result<R> {
+        let published=self.read_views.read().map_err(|_|anyhow::anyhow!("market read directory poisoned"))?
+            .get(market_id).cloned().context("market not published")?;
+        let before=published.load_full();
+        ensure!(!before.retired && before.watermark.published_cursor>0,"market not published");
+        // REST/confirmation parsing and validation may be expensive. Compute
+        // optimistically, then commit only against the exact captured revision.
+        let (next,result)=transition(&before.state)?;
         let handle = self.lane(market_id)?;
         let mut lane = handle.lock().map_err(|_| anyhow::anyhow!("market lane poisoned"))?;
         ensure!(!lane.retired && lane.published > 0, "market not published");
-        let (next, result) = transition(&lane.state)?;
+        ensure!(lane.epoch==before.watermark.stream_epoch
+            && lane.revision.load(Ordering::Relaxed)==before.revision,"market transition superseded");
         if let Some(next) = next {
             lane.state = next;
+            self.publish_state_view(market_id, &lane);
             lane.changed.send_modify(|version| *version = version.wrapping_add(1));
         }
         Ok(result)
@@ -640,6 +701,7 @@ impl<T, S: Default> MarketReplay<T, S> {
                 }
             }
             lane.durable = market_cursor;
+            self.publish_view(market_id, &lane);
             lane.changed.send_modify(|version| *version = version.wrapping_add(1));
         }
         Ok(lane.durable)
@@ -674,10 +736,9 @@ impl<T, S: Default> MarketReplay<T, S> {
             .filter(|group| group.market_cursor > after)
         {
             if groups.len() == maximum_groups || group.bytes > maximum_bytes - bytes {
-                ensure!(
-                    !groups.is_empty(),
-                    "single market group exceeds page budget"
-                );
+                if groups.is_empty() {
+                    return Err(MarketReplayGroupBudget {bytes:group.bytes,limit:maximum_bytes}.into());
+                }
                 break;
             }
             ensure!(group.market_cursor == next + 1, "market replay gap");
@@ -706,7 +767,9 @@ impl<T, S: Default> MarketReplay<T, S> {
         let lane = handle.lock().map_err(|_| anyhow::anyhow!("market lane poisoned"))?;
         ensure!(!lane.retired && lane.epoch == stream_epoch,
             "market diagnostic stream epoch changed");
-        Ok(lane.groups.iter().find_map(|group| inspect(&group.payload)))
+        let groups=lane.groups.iter().cloned().collect::<Vec<_>>();
+        drop(lane);
+        Ok(groups.iter().find_map(|group| inspect(&group.payload)))
     }
 
     pub fn replay_floor(&self, market_id: &str) -> Result<u64> {
@@ -791,8 +854,8 @@ impl<T, S: Default> MarketReplay<T, S> {
 
     pub fn invalidate_all_with(&self, invalidate: impl Fn(&mut S)) -> Result<()> {
         let lanes = self.lanes.read().map_err(|_| anyhow::anyhow!("market registry poisoned"))?
-            .values().cloned().collect::<Vec<_>>();
-        for handle in lanes {
+            .iter().map(|(id,lane)|(id.clone(),lane.clone())).collect::<Vec<_>>();
+        for (market,handle) in lanes {
             let mut lane = handle.lock().map_err(|_| anyhow::anyhow!("market lane poisoned"))?;
             let _budget = self.budget_lock.lock()
                 .map_err(|_| anyhow::anyhow!("market replay budget poisoned"))?;
@@ -805,6 +868,7 @@ impl<T, S: Default> MarketReplay<T, S> {
             invalidate(&mut lane.state);
             lane.replay_bytes = 0;
             lane.replay_floor = lane.published;
+            self.publish_state_view(&market, &lane);
             lane.changed.send_modify(|version| *version = version.wrapping_add(1));
         }
         Ok(())
@@ -851,8 +915,10 @@ impl<T, S: Default> MarketReplay<T, S> {
         lane.replay_bytes = 0;
         lane.groups.clear();
         lane.state = S::default();
+        self.publish_state_view(market_id, &lane);
         lane.changed.send_modify(|version| *version = version.wrapping_add(1));
         lanes.remove(market_id);
+        self.read_views.write().unwrap_or_else(|e|e.into_inner()).remove(market_id);
         Ok(())
     }
 
@@ -881,6 +947,39 @@ impl MarketReplay<Vec<Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn immutable_reader_does_not_wait_for_writer_lane() {
+        let replay=Arc::new(MarketReplay::<(),u64>::new_with_state(4,1024,4096).unwrap());
+        replay.register("m","epoch").unwrap();
+        let handle=replay.lane("m").unwrap();
+        let mut writer=handle.lock().unwrap();
+        writer.state=7;writer.published=1;
+        replay.publish_state_view("m",&writer);
+        let (tx,rx)=std::sync::mpsc::channel();
+        let reader=replay.clone();
+        let worker=std::thread::spawn(move||{
+            tx.send(reader.read_state("m",|value,_|Ok(*value))).unwrap();
+        });
+        let result=rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(writer);
+        worker.join().unwrap();
+        assert_eq!(result.unwrap().unwrap(),7);
+    }
+
+    #[test]
+    fn optimistic_confirmation_cannot_overwrite_a_newer_commit() {
+        let replay=MarketReplay::<(),u64>::new_with_state(4,1024,4096).unwrap();
+        replay.register("m","epoch").unwrap();
+        {let handle=replay.lane("m").unwrap();let mut lane=handle.lock().unwrap();
+            lane.state=7;lane.published=1;replay.publish_state_view("m",&lane);}
+        let result=replay.transition_state("m",|old|{
+            replay.update_state("m",|value|*value=9)?;
+            Ok((Some(*old+1),()))
+        });
+        assert!(result.unwrap_err().to_string().contains("superseded"));
+        assert_eq!(replay.read_state("m",|value,_|Ok(*value)).unwrap(),9);
+    }
     use serde_json::json;
 
     fn event(market: &str, token: &str) -> Value {
