@@ -1,0 +1,21 @@
+syntax = "proto3";
+package marketcow.common.v1;
+
+// Persistent identities are allocated, never derived from record contents.
+message RecordIdentity { string id = 1; uint64 revision = 2; }
+message EvidenceReference { string evidence_id = 1; optional uint32 row_index = 2; }
+message Error {
+  string code = 1;
+  bool retryable = 2;
+  optional uint64 retry_after_ms = 3;
+  optional string detail = 4;
+}
+enum Source {
+  SOURCE_UNSPECIFIED = 0;
+  BINANCE_SPOT_TRADE = 1;
+  CHAINLINK_BTC_USD = 2;
+  CHAINLINK_BTC_USD_TWAP60 = 3;
+}
+// All int64 *_ns timestamps are signed Unix nanoseconds. *_ms timestamps are
+// signed Unix milliseconds. Optional absence never means timestamp zero.
+// Price/quantity strings are exact non-exponent decimals, not IEEE floats.

@@ -135,16 +135,30 @@ pub fn validate_source_events(
     token_markets: &BTreeMap<String, String>,
     maximum_batch_bytes: usize,
 ) -> Result<Vec<Vec<u8>>> {
+    validate_source_events_inner(events,terminal,cursor,token_markets,maximum_batch_bytes,false)
+}
+
+fn validate_source_events_inner(
+    events: &[Value], terminal: bool, cursor: u64,
+    token_markets: &BTreeMap<String,String>, maximum_batch_bytes: usize,
+    handoff: bool,
+) -> Result<Vec<Vec<u8>>> {
     ensure!(
-        !events.is_empty() && events.len() <= 256,
-        "batch must contain 1..256 events"
+        !events.is_empty() && events.len() <= if handoff {4096} else {256},
+        "source event count exceeds selected transaction budget"
     );
+    ensure!(!handoff || (!terminal && token_markets.len()==2
+        && token_markets.values().collect::<BTreeSet<_>>().len()==1),
+        "handoff requires one complete binary market");
     let mut grouped: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut lines = Vec::new();
     let mut total: usize = 0;
     let mut received: Option<String> = None;
+    let mut handoff_received = None;
+    let mut handoff_condition: Option<String> = None;
     for (index, event) in events.iter().enumerate() {
         let recovery = is_token_recovery(event);
+        ensure!(!handoff || !recovery,"handoff cannot contain recovery control events");
         ensure!(
             event["cursor"].as_u64() == cursor.checked_add(index as u64 + 1),
             "noncontiguous source cursor"
@@ -244,18 +258,31 @@ pub fn validate_source_events(
         } else {
             let token = required(event, "token_id")?;
             let observed = required(event, "received_at")?;
-            if let Some(previous) = &received {
+            if handoff {
+                let at=chrono::DateTime::parse_from_rfc3339(observed)?;
+                ensure!(handoff_received.is_none_or(|previous|at>=previous),
+                    "handoff receipt order regressed");
+                handoff_received=Some(at);
+                let condition=required(event,"condition_id")?;
+                ensure!(handoff_condition.as_ref().is_none_or(|old|old==condition),
+                    "handoff condition changed");
+                handoff_condition=Some(condition.into());
+            } else if let Some(previous) = &received {
                 ensure!(previous == observed, "mixed recovery observation boundary");
             } else {
                 received = Some(observed.into());
             }
-            ensure!(
-                grouped
+            let first_for_token=grouped
                     .entry(market.into())
                     .or_default()
-                    .insert(token.into()),
-                "duplicate token"
-            );
+                    .insert(token.into());
+            ensure!(handoff || first_for_token,"duplicate token");
+            ensure!(!handoff || !first_for_token
+                || event["raw_payload"]["event_type"]=="book",
+                "handoff token must start with supplier snapshot");
+            ensure!(!handoff || matches!(event["raw_payload"]["event_type"].as_str(),
+                Some("book"|"price_change"|"tick_size_change"|"last_trade_price")),
+                "handoff requires ordinary supplier book evidence");
             ensure!(
                 token_markets
                     .get(token)
@@ -289,6 +316,8 @@ pub fn validate_source_events(
         ensure!(total <= maximum_batch_bytes, "batch byte budget exceeded");
         lines.push(line);
     }
+    ensure!(!handoff || (grouped.len()==1 && grouped.values().all(|tokens|tokens.len()==2)),
+        "handoff final binary market coverage absent");
     ensure!(
         grouped.values().all(|tokens| tokens.len() == 2)
             || events.iter().all(|event| {
@@ -512,7 +541,7 @@ impl ValidatedSourceBatch {
         tokens: &BTreeMap<String, String>,
         limit: usize,
     ) -> Result<Self> {
-        Self::new_inner(events, terminal, after, tokens, limit, true)
+        Self::new_inner(events, terminal, after, tokens, limit, true, false)
     }
 
     /// Validate an already market-local event sequence without preparing any
@@ -524,7 +553,14 @@ impl ValidatedSourceBatch {
         tokens: &BTreeMap<String, String>,
         limit: usize,
     ) -> Result<Self> {
-        Self::new_inner(events, terminal, after, tokens, limit, false)
+        Self::new_inner(events, terminal, after, tokens, limit, false, false)
+    }
+
+    /// Source-only atomic handoff: real snapshots followed by ordered real
+    /// observations. This is not a weaker ordinary/recovery validator.
+    pub fn new_handoff(events:Vec<Value>, after:u64,
+        tokens:&BTreeMap<String,String>, limit:usize)->Result<Self> {
+        Self::new_inner(events,false,after,tokens,limit,false,true)
     }
 
     fn new_inner(
@@ -534,8 +570,9 @@ impl ValidatedSourceBatch {
         tokens: &BTreeMap<String, String>,
         limit: usize,
         prepare_cursor_encoding: bool,
+        handoff: bool,
     ) -> Result<Self> {
-        let lines = validate_source_events(&events, terminal, after, tokens, limit)?;
+        let lines = validate_source_events_inner(&events, terminal, after, tokens, limit,handoff)?;
         // Conservative metadata allowance, within the existing batch budget.
         // No full-book duplication and no unbounded per-event cache.
         let cache_budget = limit.saturating_sub(lines.iter().map(Vec::len).sum())
@@ -870,7 +907,7 @@ pub fn read_durable_market_page(
             "market replay index gap or unpublished group"
         );
         let expected = usize::try_from(last_global - first_global + 1)?;
-        ensure!(expected <= 256, "market replay group event cap");
+        ensure!(expected <= 4096, "market replay group event cap");
         let (count, declared_bytes): (i64, i64) = if bounded {
             tx.query_row(
                 "SELECT COUNT(*),COALESCE(SUM(length(payload)),0) FROM recent_events \
@@ -2316,6 +2353,32 @@ impl PreparedSourceWriter {
 mod tests {
     use super::*;
     use marketcow_polymarket::discovery_source::{SnapshotBoundary, snapshot_event};
+    fn handoff_events(count:usize)->Vec<Value> {
+        (0..count).map(|index| {
+            let mut value=event(if index%2==0 {"11"}else{"12"},index as u64+1);
+            value["raw_payload"]["event_type"]=json!("book");
+            value["received_at"]=json!(chrono::DateTime::<chrono::Utc>::from_timestamp(
+                1700000001+index as i64,0).unwrap().to_rfc3339());
+            rehash(&mut value);value
+        }).collect()
+    }
+    #[test]
+    fn handoff_has_ordered_multi_observation_budget_without_relaxing_ordinary_batches() {
+        let tokens=[("11".into(),"1".into()),("12".into(),"1".into())].into();
+        let events=handoff_events(300);
+        assert!(ValidatedSourceBatch::new_handoff(events.clone(),0,&tokens,16*1024*1024).is_ok());
+        assert!(ValidatedSourceBatch::new(events,false,0,&tokens,16*1024*1024).is_err());
+        assert!(ValidatedSourceBatch::new(handoff_events(4),false,0,&tokens,65536).is_err());
+        let mut backwards=handoff_events(4);
+        backwards[3]["received_at"]=backwards[0]["received_at"].clone();
+        rehash(&mut backwards[3]);
+        assert!(ValidatedSourceBatch::new_handoff(backwards,0,&tokens,65536).is_err());
+        assert!(ValidatedSourceBatch::new_handoff(handoff_events(1),0,&tokens,65536).is_err());
+        let mut tampered=handoff_events(4);
+        tampered[2]["raw_payload"]["hash"]=json!("tampered");
+        assert!(ValidatedSourceBatch::new_handoff(tampered,0,&tokens,65536).is_err());
+        assert!(ValidatedSourceBatch::new_handoff(handoff_events(4),0,&tokens,1).is_err());
+    }
     #[test]
     fn terminal_commit_preserves_books_and_reopens_at_contiguous_boundary() {
         let temp = fixture();

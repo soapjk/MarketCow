@@ -22,6 +22,7 @@ import time
 ROOT = Path('/mnt/p44pro/marketcow-shadow-v3-runtime/linux')
 UNIT = 'marketcow-polymarket-collector.service'
 DEPLOY = ROOT / 'deployment'
+OUTER_BUILD_PARENT = ROOT.parent
 
 
 def run(argv, **kwargs):
@@ -41,6 +42,16 @@ def remove_owned(path, parent):
             shutil.rmtree(path)
         else:
             path.unlink()
+
+
+def check_build_space(runtime_free, build_free, external_build):
+    if external_build:
+        if runtime_free < 2 * 1024**3:
+            raise RuntimeError('2GiB free required on runtime volume for installation and archive writes')
+        if build_free < 6 * 1024**3:
+            raise RuntimeError('6GiB free required on isolated build volume')
+    elif runtime_free < 6 * 1024**3:
+        raise RuntimeError('6GiB free required for isolated compilation')
 
 
 def source_files(repo):
@@ -93,11 +104,17 @@ def local(args):
                             f'{shlex.quote(args.btc_chainlink_credentials)}'
                             if args.btc_chainlink_credentials is not None else '')
         btc_5m_option = f' --btc-5m-clients {args.btc_5m_clients}'
+        polynode_option = (' --disable-btc-polynode' if args.disable_btc_polynode else
+                           f' --btc-polynode-key-file {shlex.quote(args.btc_polynode_key_file)}')
+        uk_ws_option = ' --uk-polymarket-ws-route' if args.uk_polymarket_ws_route else ''
         quick_option = ' --quick' if args.quick else ''
+        external_build_option = ' --external-build' if args.external_build else ''
         run([*ssh, f'python3 {DEPLOY}/incoming/deploy_u1_marketcow.py '
              f'--remote --archive-sha256 {sha(archive)} --jobs {args.jobs}'
              f'{replay_option}{persistence_option}{chainlink_option}{btc_5m_option}'
-             f'{quick_option}'])
+             f'{polynode_option}'
+             f'{uk_ws_option}'
+             f'{quick_option}{external_build_option}'])
 
 
 def unpack_verified(archive, manifest, destination):
@@ -177,7 +194,8 @@ def cleanup_previous_versions():
 
 def rewrite_unit(unit, current, memory_replay_bytes=None,
                  persistence_queue_batches=None, persistence_queue_bytes=None,
-                 btc_chainlink_credentials=None, btc_5m_clients=None):
+                 btc_chainlink_credentials=None, btc_5m_clients=None,
+                 btc_polynode_key_file=None, disable_polynode=False):
     matches = re.findall(r'/[^\s\\]+/marketcow-discovery-collector', unit)
     if len(matches) != 1:
         raise RuntimeError('expected exactly one collector executable in formal unit')
@@ -215,7 +233,89 @@ def rewrite_unit(unit, current, memory_replay_bytes=None,
             if updated.count(marker) != 1:
                 raise RuntimeError('expected one BTC research component in formal unit')
             updated = updated.replace(marker, option + ' ' + marker)
+    if disable_polynode:
+        existing = re.findall(r'--btc-polynode-key-file\s+[^\s\\]+', updated)
+        if len(existing) > 1:
+            raise RuntimeError('multiple PN1 key options in formal unit')
+        if existing:
+            updated = updated.replace(existing[0], '', 1)
+    elif btc_polynode_key_file is not None:
+        option = f'--btc-polynode-key-file {btc_polynode_key_file}'
+        existing = re.findall(r'--btc-polynode-key-file\s+[^\s\\]+', updated)
+        if len(existing) > 1:
+            raise RuntimeError('multiple PN1 key options in formal unit')
+        if existing:
+            updated = updated.replace(existing[0], option)
+        else:
+            marker = '--btc-5m-manager-root '
+            if updated.count(marker) != 1:
+                raise RuntimeError('expected one BTC 5m manager in formal unit')
+            updated = updated.replace(marker, option + ' ' + marker)
     return updated
+
+
+def rewrite_btc_research_clients(unit, clients):
+    if not 1 <= clients <= 64:
+        raise ValueError('BTC research clients must be between 1 and 64')
+    matches = re.findall(r'--btc-research-clients\s+\d+', unit)
+    if len(matches) != 1:
+        raise RuntimeError('expected exactly one BTC research client limit')
+    return unit.replace(matches[0], f'--btc-research-clients {clients}', 1)
+
+
+def configure_btc_research_clients(args):
+    """A single scoped config change; no source sync, rebuild or other flags."""
+    clients = args.configure_btc_research_clients
+    if not args.remote:
+        ssh = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', args.host]
+        run([*ssh, f'mkdir -p {DEPLOY}/incoming && chmod 700 {DEPLOY}/incoming'])
+        run(['scp', '-q', str(Path(__file__).resolve()), f'{args.host}:{DEPLOY}/incoming/'])
+        run([*ssh, f'python3 {DEPLOY}/incoming/deploy_u1_marketcow.py '
+             f'--remote --configure-btc-research-clients {clients}'])
+        return
+    with (DEPLOY / 'deploy.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        unit_path = Path.home() / '.config/systemd/user' / UNIT
+        original = unit_path.read_text()
+        updated = rewrite_btc_research_clients(original, clients)
+        binary = DEPLOY / 'current/marketcow-discovery-collector'
+        binary_hash = sha(binary)
+        started = time.time()
+        if updated != original:
+            unit_path.write_text(updated)
+            unit_path.chmod(0o600)
+            run(['systemctl', '--user', 'daemon-reload'])
+            run(['systemctl', '--user', 'restart', UNIT])
+        pid = int(subprocess.check_output(['systemctl', '--user', 'show', UNIT,
+                                          '-p', 'MainPID', '--value']))
+        for _ in range(5):
+            time.sleep(2)
+            state = dict(line.split('=', 1) for line in subprocess.check_output(
+                ['systemctl', '--user', 'show', UNIT, '-p', 'MainPID',
+                 '-p', 'NRestarts', '-p', 'ActiveState'], text=True).splitlines())
+            if (state.get('ActiveState') != 'active' or int(state.get('MainPID', 0)) != pid
+                    or int(state.get('NRestarts', -1)) != 0):
+                raise RuntimeError('collector restarted/exited during config verification')
+        children = subprocess.check_output(['pgrep', '-P', str(pid)], text=True).split()
+        matched = [child for child in children if sha(Path('/proc') / child / 'exe') == binary_hash]
+        if not matched or sha(binary) != binary_hash:
+            raise RuntimeError('installed/running binary changed during config-only update')
+        for child in matched:
+            argv = (Path('/proc') / child / 'cmdline').read_bytes().split(b'\0')
+            index = argv.index(b'--btc-research-clients')
+            if argv[index + 1] != str(clients).encode():
+                raise RuntimeError('running BTC research client limit differs')
+        receipt = {'status': 'configured', 'unit': UNIT, 'main_pid': pid,
+                   'collector_pids': matched, 'binary_sha256': binary_hash,
+                   'btc_research_clients': clients, 'unit_sha256': sha(unit_path),
+                   'started_at': started, 'finished_at': time.time(),
+                   'startup_no_restart_seconds': 10, 'recompiled': False,
+                   'only_changed_setting': '--btc-research-clients',
+                   'restarted': updated != original}
+        (DEPLOY / 'config-receipt.json').write_text(json.dumps(receipt, sort_keys=True, indent=2))
+        shutil.copyfile(Path(__file__), DEPLOY / 'source/scripts/deploy_u1_marketcow.py')
+        remove_owned(DEPLOY / 'incoming', DEPLOY)
+        print(json.dumps(receipt, sort_keys=True), flush=True)
 
 
 def validate_chainlink_credentials_path(value):
@@ -226,6 +326,62 @@ def validate_chainlink_credentials_path(value):
     if (path.parent != allowed or not re.fullmatch(r'[A-Za-z0-9_.-]+\.json', path.name)):
         raise RuntimeError('Chainlink credentials must be a private MarketCow secrets JSON path')
     return path
+
+
+def validate_polynode_key_path(value):
+    path = Path(value)
+    allowed = {
+        Path('/mnt/p44pro/marketcow-shadow-v3-runtime/linux/diagnostics/polynode-probe/api-key'),
+        Path('/home/czx/.config/marketcow/secrets/polynode-pn1.key'),
+    }
+    if path not in allowed:
+        raise RuntimeError('PN1 key must use an approved private U1 path')
+    return path
+
+
+def pin_uk_polymarket_ws_route():
+    """Route only the public CLOB market WS through the fixed UK Pro node."""
+    import yaml
+    config_path = ROOT / 'polymarket-proxy/config.yaml'
+    if config_path.is_symlink() or not config_path.is_file():
+        raise RuntimeError('formal proxy config is absent or linked')
+    original = config_path.read_bytes()
+    config = yaml.safe_load(original)
+    node = '🇬🇧 英国-Pro-01|v202605'
+    if node not in {item['name'] for item in config['proxies']}:
+        raise RuntimeError('fixed UK Pro node is absent')
+    if not any(group.get('name') == 'POLYMARKET' for group in config['proxy-groups']):
+        raise RuntimeError('formal Polymarket proxy group is absent')
+    config['proxy-groups'] = [group for group in config['proxy-groups']
+                              if group.get('name') != 'POLYMARKET_WS']
+    config['proxy-groups'].insert(0, {
+        'name': 'POLYMARKET_WS', 'type': 'select', 'proxies': [node]})
+    rule = 'DOMAIN,ws-subscriptions-clob.polymarket.com,POLYMARKET_WS'
+    config['rules'] = [rule] + [item for item in config['rules'] if item != rule]
+    replacement = yaml.safe_dump(config, allow_unicode=True).encode()
+
+    def atomic_write(payload):
+        with tempfile.NamedTemporaryFile(dir=config_path.parent, delete=False) as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(payload)
+            name = stream.name
+        Path(name).replace(config_path)
+
+    atomic_write(replacement)
+    try:
+        run(['systemctl', '--user', 'restart', 'marketcow-polymarket-proxy.service'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        result = subprocess.run(['systemctl', '--user', 'is-active',
+                                 'marketcow-polymarket-proxy.service'],
+                                capture_output=True, text=True)
+        if result.stdout.strip() != 'active':
+            raise RuntimeError('UK WS proxy did not start')
+    except Exception:
+        atomic_write(original)
+        run(['systemctl', '--user', 'restart', 'marketcow-polymarket-proxy.service'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        raise
+    return node
 
 
 def remote(args):
@@ -249,17 +405,27 @@ def remote(args):
         remove_owned(source, DEPLOY)
         staging.rename(source)
         (DEPLOY / 'source-manifest.json').write_text(json.dumps(manifest, sort_keys=True))
-        target = DEPLOY / 'target'
-        # A failed pre-publication build may retain this isolated target for
-        # forward-fix retries. Cargo fingerprints every staged source input;
-        # the target is removed only after a verified formal start below.
+        external_stage = None
+        if args.external_build:
+            if (OUTER_BUILD_PARENT.is_symlink() or not OUTER_BUILD_PARENT.is_dir()
+                    or subprocess.check_output(['findmnt', '-n', '-o', 'FSTYPE',
+                                                '-T', str(OUTER_BUILD_PARENT)],
+                                               text=True).strip() != 'fuseblk'):
+                raise RuntimeError('outer isolated build volume must be the expected NTFS mount')
+            check_build_space(shutil.disk_usage(ROOT).free,
+                              shutil.disk_usage(OUTER_BUILD_PARENT).free, True)
+            external_stage = Path(tempfile.mkdtemp(prefix='collector-build-',
+                                                    dir=OUTER_BUILD_PARENT))
+            target = external_stage / 'target'
+            tmp = external_stage / 'tmp'
+        else:
+            target = DEPLOY / 'target'
+            tmp = ROOT / 'tmp'
+            check_build_space(shutil.disk_usage(ROOT).free, 0, False)
         if target.is_symlink():
             raise RuntimeError('unsafe build target symlink')
-        tmp = ROOT / 'tmp'
         tmp.mkdir(mode=0o700, exist_ok=True)
         tmp.chmod(0o700)
-        if shutil.disk_usage(ROOT).free < 6 * 1024**3:
-            raise RuntimeError('6GiB free required for isolated compilation')
         env = dict(os.environ, TMPDIR=str(tmp), CARGO_TARGET_DIR=str(target),
                    CARGO_INCREMENTAL='0', CARGO_PROFILE_TEST_DEBUG='0',
                    CARGO_BUILD_JOBS=str(args.jobs))
@@ -267,27 +433,37 @@ def remote(args):
                    'unit': UNIT, 'status': 'building', 'started_at': time.time(),
                    'test_scope': 'local_targeted_only' if args.quick else 'u1_offline_full'}
         log_path = DEPLOY / 'build.log'
-        with log_path.open('w') as log:
-            if not args.quick:
-                run(['nice', '-n', '10', 'cargo', 'test', '--offline', '--locked',
-                     '-p', 'marketcow-core', '-p', 'marketcow-polymarket',
-                     '--lib', '--quiet'], cwd=source, env=env, stdout=log, stderr=log)
-                run(['nice', '-n', '10', 'cargo', 'test', '--offline', '--locked',
-                     '-p', 'marketcowd', '--bins', '--quiet'], cwd=source, env=env, stdout=log, stderr=log)
-            run(['nice', '-n', '10', 'cargo', 'build', '--offline', '--locked', '--release',
-                 '-p', 'marketcowd', '--bin', 'marketcow-discovery-collector'], cwd=source,
-                env=env, stdout=log, stderr=log)
-        binary = target / 'release/marketcow-discovery-collector'
-        with binary.open('rb') as stream:
-            elf = stream.read(20)
-        if elf[:6] != b'\x7fELF\x02\x01' or int.from_bytes(elf[18:20], 'little') != 62:
-            raise RuntimeError('build output must be ELF64 little-endian x86-64')
-        current = DEPLOY / 'current'
-        current.mkdir(mode=0o700, exist_ok=True)
-        candidate = current / 'collector.new'
-        shutil.copyfile(binary, candidate)
-        candidate.chmod(0o755)
-        receipt['binary_sha256'] = sha(candidate)
+        try:
+            with log_path.open('w') as log:
+                if not args.quick:
+                    run(['nice', '-n', '10', 'cargo', 'test', '--offline', '--locked',
+                         '-p', 'marketcow-core', '-p', 'marketcow-polymarket',
+                         '--lib', '--quiet'], cwd=source, env=env, stdout=log, stderr=log)
+                    run(['nice', '-n', '10', 'cargo', 'test', '--offline', '--locked',
+                         '-p', 'marketcowd', '--bins', '--quiet'], cwd=source,
+                        env=env, stdout=log, stderr=log)
+                run(['nice', '-n', '10', 'cargo', 'build', '--offline', '--locked',
+                     '--release', '-p', 'marketcowd', '--bin',
+                     'marketcow-discovery-collector'], cwd=source, env=env,
+                    stdout=log, stderr=log)
+            binary = target / 'release/marketcow-discovery-collector'
+            with binary.open('rb') as stream:
+                elf = stream.read(20)
+            if elf[:6] != b'\x7fELF\x02\x01' or int.from_bytes(elf[18:20], 'little') != 62:
+                raise RuntimeError('build output must be ELF64 little-endian x86-64')
+            current = DEPLOY / 'current'
+            current.mkdir(mode=0o700, exist_ok=True)
+            candidate = current / 'collector.new'
+            shutil.copyfile(binary, candidate)
+            candidate.chmod(0o755)
+            if sha(binary) != sha(candidate):
+                raise RuntimeError('isolated build output changed during installation copy')
+            receipt['binary_sha256'] = sha(candidate)
+            receipt['build_volume'] = ('outer_ntfs_ephemeral' if args.external_build
+                                       else 'runtime_ext4')
+        finally:
+            if external_stage is not None:
+                remove_owned(external_stage, OUTER_BUILD_PARENT)
         unit_path = Path.home() / '.config/systemd/user' / UNIT
         unit = unit_path.read_text()
         credentials = validate_chainlink_credentials_path(args.btc_chainlink_credentials)
@@ -297,11 +473,22 @@ def remote(args):
                     or metadata.st_uid != os.geteuid()
                     or metadata.st_mode & 0o077 or metadata.st_size > 4096):
                 raise RuntimeError('Chainlink credentials are absent or not a private regular file')
+        polynode_key = None
+        if not args.disable_btc_polynode:
+            polynode_key = validate_polynode_key_path(args.btc_polynode_key_file)
+            key_metadata = polynode_key.lstat()
+            if (not polynode_key.is_file() or polynode_key.is_symlink()
+                    or key_metadata.st_uid != os.geteuid()
+                    or key_metadata.st_mode & 0o077 or not 1 <= key_metadata.st_size <= 512):
+                raise RuntimeError('PN1 key is absent or not a private regular file')
         updated = rewrite_unit(unit, current, args.memory_replay_bytes,
                                args.persistence_queue_batches, args.persistence_queue_bytes,
                                str(credentials) if credentials is not None else None,
-                               args.btc_5m_clients)
+                               args.btc_5m_clients, str(polynode_key) if polynode_key else None,
+                               disable_polynode=args.disable_btc_polynode)
         run(['systemctl', '--user', 'stop', UNIT])
+        if args.uk_polymarket_ws_route:
+            receipt['polymarket_ws_route'] = pin_uk_polymarket_ws_route()
         candidate.replace(current / 'marketcow-discovery-collector')
         shutil.copyfile(source / 'scripts/run_with_bounded_log.py', current / 'run_with_bounded_log.py')
         unit_path.write_text(updated)
@@ -342,7 +529,8 @@ def remote(args):
                 raise RuntimeError('collector exited/restarted during startup verification')
         receipt['startup_no_restart_seconds'] = 10
         receipt['removed_paths'] = cleanup_previous_versions()
-        remove_owned(target, DEPLOY)
+        if not args.external_build:
+            remove_owned(target, DEPLOY)
         remove_owned(DEPLOY / 'incoming', DEPLOY)
         receipt.update(status='started', finished_at=time.time(), main_pid=pid,
                        unit_sha256=sha(unit_path), startup_status_sha256=sha(DEPLOY / 'startup-status.json'))
@@ -356,6 +544,10 @@ if __name__ == '__main__':
     parser.add_argument('--jobs', type=int, choices=range(1, 9), default=2)
     parser.add_argument('--quick', action='store_true',
                         help='skip full offline test suite after targeted local verification')
+    parser.add_argument('--external-build', action='store_true',
+                        help='build in an ephemeral outer NTFS directory with separate space guards')
+    parser.add_argument('--configure-btc-research-clients', type=int, choices=range(1, 65),
+                        help='change only existing BTC client budget, verify same ELF; no rebuild')
     parser.add_argument('--memory-replay-bytes', type=int, choices=(2 * 1024**3, 6 * 1024**3))
     parser.add_argument('--persistence-queue-batches', type=int, choices=(2048, 16384))
     parser.add_argument('--persistence-queue-bytes', type=int,
@@ -364,10 +556,22 @@ if __name__ == '__main__':
                         help='existing private CLOB L2 credentials file on U1; never uploaded')
     parser.add_argument('--btc-5m-clients', type=int, choices=range(1, 13), default=12,
                         help='bounded global BTC 5m WS budget; 12 gives four slots per market')
+    parser.add_argument('--btc-polynode-key-file', default=str(
+        ROOT / 'diagnostics/polynode-probe/api-key'),
+        help='existing private PN1 key file on U1; key contents are never uploaded')
+    parser.add_argument('--disable-btc-polynode', action='store_true',
+                        help='omit PN1 subscription without deleting the private key file')
+    parser.add_argument('--uk-polymarket-ws-route', action='store_true',
+                        help='pin only the public market WebSocket to the UK Pro proxy node')
     parser.add_argument('--remote', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--archive-sha256', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.configure_btc_research_clients is not None:
+        configure_btc_research_clients(args)
+        raise SystemExit(0)
     if (args.persistence_queue_batches is None) != (args.persistence_queue_bytes is None):
         parser.error('persistence queue batches and bytes must be supplied together')
     validate_chainlink_credentials_path(args.btc_chainlink_credentials)
+    if not args.disable_btc_polynode:
+        validate_polynode_key_path(args.btc_polynode_key_file)
     remote(args) if args.remote else local(args)

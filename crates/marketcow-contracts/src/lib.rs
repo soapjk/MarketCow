@@ -1,6 +1,10 @@
 //! Versioned public and worker-facing contracts; no runtime, storage, or provider dependency.
 
 pub mod btc5m_market_local_v3;
+pub mod btc5m_market_local_v5;
+pub mod btc5m_market_local_v6;
+pub mod btc5m_market_local_v4;
+pub mod typed_v3;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

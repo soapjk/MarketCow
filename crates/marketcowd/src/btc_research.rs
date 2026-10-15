@@ -10,7 +10,7 @@ use axum::{
         Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{HeaderMap, StatusCode, header::SEC_WEBSOCKET_PROTOCOL},
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -109,6 +109,7 @@ pub struct Service {
     second: Arc<Shared>,
     chainlink: btc_chainlink::Service,
     trade: btc_trade::Service,
+    trade_rest: btc_trade::official_rest::Service,
     price_clients: Arc<Semaphore>,
 }
 
@@ -201,8 +202,9 @@ impl Service {
         let chainlink = btc_chainlink::Service::start(
             minute.config.root.clone(), minute.config.chainlink_credentials.clone());
         let trade = btc_trade::Service::start(minute.config.root.clone());
+        let trade_rest = btc_trade::official_rest::Service::start(minute.config.root.clone())?;
         let price_clients = Arc::new(Semaphore::new(minute.config.clients));
-        Ok(Self { minute, second, chainlink, trade, price_clients })
+        Ok(Self { minute, second, chainlink, trade, trade_rest, price_clients })
     }
 
     pub fn router(&self) -> Router {
@@ -219,15 +221,14 @@ impl Service {
             .route("/v1/btc-research/finalized-1s-window", get(window))
             .route("/v1/btc-research/finalized-1s-facts", get(facts))
             .with_state(self.second.clone());
-        let price_routes = Router::new()
-            .route("/v1/btc-research/price-window", get(price_window))
-            .with_state(Arc::new(self.chainlink.clone()));
-        let price_stream_routes = Router::new()
-            .route("/v1/btc-research/price-stream", get(price_stream))
-            .with_state(Arc::new((self.second.clone(), self.chainlink.clone(),
-                self.trade.clone(), self.price_clients.clone())));
         status_routes.merge(minute_routes).merge(second_routes)
-            .merge(price_routes).merge(price_stream_routes)
+            .merge(self.trade_rest.router())
+            .merge(crate::btc_typed_api::Service {
+                binance:self.trade.clone(),chainlink_twap:Some(self.chainlink.clone()),
+                database:self.minute.config.root.join("binance-trades/trades.sqlite3"),
+                history:Arc::new(crate::btc_typed_history::Service::new(self.minute.config.root.join("binance-trades/trades.sqlite3"))),
+                clients:self.price_clients.clone(),requests:Arc::new(Semaphore::new(4)),
+            }.router())
     }
 }
 
@@ -1101,143 +1102,6 @@ async fn window(State(shared): State<Arc<Shared>>) -> Response {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PriceWindowQuery {
-    source: String,
-}
-
-const PRICE_STREAM_SCHEMA: &str = "marketcow.btc-price-stream.v2";
-const PRICE_STREAM_PROTOCOL: &str = "marketcow.btc-price.v2";
-
-async fn price_stream(
-    State(source): State<Arc<(Arc<Shared>, btc_chainlink::Service, btc_trade::Service, Arc<Semaphore>)>>,
-    Query(query): Query<PriceWindowQuery>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Response {
-    let offered = headers.get(SEC_WEBSOCKET_PROTOCOL)
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
-    if !offered.split(',').map(str::trim).any(|v| v == PRICE_STREAM_PROTOCOL) {
-        return error(StatusCode::BAD_REQUEST, "btc_price_subprotocol_required");
-    }
-    if !matches!(query.source.as_str(), "chainlink_twap_60s" | "binance_spot_trade") {
-        return error(StatusCode::BAD_REQUEST, "unsupported_price_source");
-    }
-    let Ok(permit) = source.3.clone().try_acquire_owned() else {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "btc_price_stream_capacity");
-    };
-    ws.protocols([PRICE_STREAM_PROTOCOL]).max_message_size(4096).max_frame_size(4096)
-        .on_upgrade(move |socket| price_stream_socket(source, query.source, socket, permit))
-}
-
-async fn price_stream_socket(
-    source: Arc<(Arc<Shared>, btc_chainlink::Service, btc_trade::Service, Arc<Semaphore>)>,
-    selected: String,
-    mut socket: WebSocket,
-    _permit: tokio::sync::OwnedSemaphorePermit,
-) {
-    let chainlink = selected == "chainlink_twap_60s";
-    let mut chainlink_events = source.1.subscribe();
-    let mut trade_events = source.2.subscribe();
-    let initial = if chainlink {
-        source.1.stream_snapshot().await
-    } else {
-        source.2.stream_snapshot().await
-    };
-    let mut epoch = initial["source_epoch"].as_str().unwrap_or("").to_owned();
-    let mut sequence = initial["message_sequence"].as_u64().unwrap_or(0);
-    let mut serial = initial["stream_serial"].as_u64().unwrap_or(0);
-    let mut ready = initial["type"] == "snapshot";
-    if send_price_frame(&source.0, &mut socket, &initial).await.is_err() { return; }
-    let mut ping = tokio::time::interval(Duration::from_secs(15));
-    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        let event = tokio::select! {
-            value = chainlink_events.recv(), if chainlink => value,
-            value = trade_events.recv(), if !chainlink => value,
-            input = socket.recv() => match input {
-                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
-                Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) => break,
-                _ => continue,
-            },
-            _ = ping.tick() => {
-                if !matches!(tokio::time::timeout(source.0.config.send_timeout,
-                    socket.send(Message::Ping(Vec::new().into()))).await, Ok(Ok(()))) {
-                    break;
-                }
-                continue;
-            },
-        };
-        let frame = match event {
-            Ok(value) => value,
-            Err(_) => {
-                let failure = json!({"schema_version":PRICE_STREAM_SCHEMA,
-                    "type":"stream_error","source":selected,
-                    "reason":"consumer_lagged_or_source_channel_closed",
-                    "observed_at":Utc::now().to_rfc3339()});
-                let _ = send_price_frame(&source.0, &mut socket, &failure).await;
-                break;
-            }
-        };
-        let next_epoch = frame["source_epoch"].as_str().unwrap_or("");
-        let next_sequence = frame["message_sequence"].as_u64().unwrap_or(0);
-        let next_serial = frame["stream_serial"].as_u64().unwrap_or(0);
-        // A subscription is installed before the owner snapshot. Frames
-        // already represented by that snapshot can span older source epochs.
-        if next_serial <= serial { continue; }
-        let next_type = frame["type"].as_str().unwrap_or("");
-        let reset = (next_epoch != epoch && matches!(next_type,
-            "unavailable" | "snapshot"))
-            || (!ready && next_epoch == epoch && next_type == "snapshot");
-        if next_serial != serial.saturating_add(1)
-            || (!reset && (next_epoch != epoch
-                || next_sequence != sequence.saturating_add(1))) {
-            let failure = json!({"schema_version":PRICE_STREAM_SCHEMA,
-                "type":"stream_error","source":selected,
-                "reason":"price_stream_sequence_gap",
-                "observed_at":Utc::now().to_rfc3339()});
-            let _ = send_price_frame(&source.0, &mut socket, &failure).await;
-            break;
-        }
-        if send_price_frame(&source.0, &mut socket, &frame).await.is_err() { break; }
-        epoch = next_epoch.to_owned();
-        sequence = next_sequence;
-        serial = next_serial;
-        ready = next_type == "snapshot" || (ready && matches!(next_type, "point" | "trade"));
-    }
-    let _ = socket.close().await;
-}
-
-async fn send_price_frame(shared: &Shared, socket: &mut WebSocket, frame: &Value) -> Result<()> {
-    let encoded = serde_json::to_vec(frame)?;
-    ensure!(encoded.len() <= shared.config.response_bytes,
-        "BTC price frame exceeds response budget");
-    tokio::time::timeout(shared.config.send_timeout,
-        socket.send(Message::Text(String::from_utf8(encoded)?.into())))
-        .await.context("BTC price stream send timeout")??;
-    Ok(())
-}
-
-async fn price_window(
-    State(chainlink): State<Arc<btc_chainlink::Service>>,
-    Query(query): Query<PriceWindowQuery>,
-) -> Response {
-    match query.source.as_str() {
-        "chainlink_twap_60s" => match chainlink.window().await {
-            Ok(value) => Json(value).into_response(),
-            Err(_) => {
-                let source_status = chainlink.unavailable_status().await;
-                (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"detail":{
-                    "code":"selected_chainlink_source_unavailable",
-                    "message":"selected_chainlink_source_unavailable",
-                    "retryable":true,"source_status":source_status,
-                }}))).into_response()
-            }
-        },
-        _ => error(StatusCode::BAD_REQUEST, "unsupported_price_source"),
-    }
-}
 fn window_json_for_expected(s: &Runtime, spec: FeedSpec, expected: i64) -> Option<Value> {
     let Some(c) = &s.durable_checkpoint else {
         return None;

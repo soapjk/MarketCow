@@ -1,0 +1,76 @@
+syntax = "proto3";
+package marketcow.btc.v3;
+import "marketcow/common/v1/types.proto";
+
+message Trade {
+  uint64 trade_id = 1;
+  int64 trade_time_ms = 2;
+  optional int64 event_time_ms = 3;
+  string price = 4;
+  string quantity = 5;
+  optional bool buyer_is_maker = 6; // Required presence; false is valid.
+  optional int64 received_at_ns = 7;
+  optional marketcow.common.v1.EvidenceReference evidence = 8;
+}
+message Observation {
+  int64 source_time_ms = 1;
+  string price = 2;
+  optional uint64 source_sequence = 3; // Required, >0 for this supplier.
+  optional uint32 row_index = 4; // Required; zero is the first source row.
+  optional int64 received_at_ns = 5;
+  optional marketcow.common.v1.EvidenceReference evidence = 6;
+}
+message Snapshot {
+  repeated Trade trades = 1;
+  repeated Observation observations = 2;
+  bool truncated = 3;
+  uint64 retained_count = 4;
+  optional uint64 first_trade_id = 5;
+  optional uint64 last_trade_id = 6;
+}
+// Exactly one new trade. Never includes cumulative history.
+message TradeDelta { Trade trade = 1; }
+// A supplier Chainlink frame can contain several observations with one seq.
+message ObservationDelta { repeated Observation observations = 1; }
+enum Phase {
+  PHASE_UNSPECIFIED = 0;
+  CONNECTING = 1;
+  UNAVAILABLE = 2;
+  RECOVERING = 3;
+  LIVE = 4;
+}
+message Status { Phase phase = 1; optional string reason = 2; }
+message PriceFrame {
+  string schema_version = 1; // marketcow.btc-price-stream.v3
+  string producer_instance_id = 2;
+  string stream_id = 3; // Source generation, shared by subscriptions.
+  uint64 stream_sequence = 4; // Owner publication serial, NOT per-client.
+  marketcow.common.v1.Source source = 5;
+  string instrument_id = 6;
+  optional uint64 source_sequence = 7;
+  int64 published_at_ns = 8; // Diagnostic only.
+  optional int64 latest_source_age_ms_at_emit = 9; // Signed, never clamped.
+  oneof payload {
+    Snapshot snapshot = 10;
+    TradeDelta trade = 11;
+    ObservationDelta observations = 12;
+    Status status = 13;
+    marketcow.common.v1.Error error = 14;
+  }
+}
+// One PriceFrame per WS binary message; no JSON/base64 or local checksum.
+// The first usable data is a snapshot. Following unavailable status, the same
+// transport can recover only through a new snapshot. A source generation may
+// change only at a recovery snapshot, while stream_sequence stays consecutive.
+// Duplicate supplier IDs require economic field equality, not decimal lexeme
+// equality. Freshness is a consumer decision, not transport validity.
+// Initial snapshot/status establishes any nonnegative serial. Thereafter every
+// delivered publication is last+1, including status and recovery snapshot;
+// stream_id may change ONLY with a snapshot. Ignore queued frames whose serial
+// is <= the initial atomic subscription snapshot serial, before generation checks.
+// All source T/E are Unix ms >0 (zero is invalid, never a missing clock default).
+// Snapshot is source-exclusive: Binance has trades only; Chainlink observations
+// only. ObservationDelta rows share one required source_sequence, have contiguous
+// row_index 0..N-1 in original supplier order and nondecreasing source_time_ms.
+// Equal-T observations remain distinct facts (no upsert); older T is rejected.
+// A Chainlink recovery snapshot resets the observation generation and baseline.

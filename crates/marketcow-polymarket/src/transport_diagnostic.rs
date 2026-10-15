@@ -66,6 +66,7 @@ pub(super) struct TransportDiagnostic {
     slow_samples: u8,
     source_age: Distribution,
     socket_next_poll: Distribution,
+    socket_ingress_queue: Distribution,
     json_decode: Distribution,
     shared_slot_wait: Distribution,
     shared_byte_wait: Distribution,
@@ -74,6 +75,10 @@ pub(super) struct TransportDiagnostic {
 }
 
 impl TransportDiagnostic {
+    pub(super) fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
+
     pub(super) fn new(tokens: &std::collections::BTreeSet<String>) -> Self {
         let opened_at = Utc::now();
         Self {
@@ -94,6 +99,7 @@ impl TransportDiagnostic {
             slow_samples: 0,
             source_age: Distribution::default(),
             socket_next_poll: Distribution::default(),
+            socket_ingress_queue: Distribution::default(),
             json_decode: Distribution::default(),
             shared_slot_wait: Distribution::default(),
             shared_byte_wait: Distribution::default(),
@@ -180,6 +186,10 @@ impl TransportDiagnostic {
             .add(duration_ms(timing.queue_slot_wait));
     }
 
+    pub(super) fn record_socket_ingress_wait(&mut self, wait: Duration) {
+        self.socket_ingress_queue.add(duration_ms(wait));
+    }
+
     pub(super) fn set_tokens(&mut self, tokens: &std::collections::BTreeSet<String>) {
         self.flush();
         self.source_tokens = tokens.iter().cloned().collect();
@@ -211,6 +221,7 @@ impl TransportDiagnostic {
                 "source_time_future":self.source_time_future,
                 "source_to_receive_ms_uncalibrated":self.source_age.json(),
                 "socket_next_poll_ms_not_network_time":self.socket_next_poll.json(),
+                "socket_ingress_queue_ms":self.socket_ingress_queue.json(),
                 "json_decode_ms":self.json_decode.json(),
                 "shared_slot_wait_ms":self.shared_slot_wait.json(),
                 "shared_byte_wait_ms":self.shared_byte_wait.json(),
@@ -229,6 +240,7 @@ impl TransportDiagnostic {
         self.slow_samples = 0;
         self.source_age = Distribution::default();
         self.socket_next_poll = Distribution::default();
+        self.socket_ingress_queue = Distribution::default();
         self.json_decode = Distribution::default();
         self.shared_slot_wait = Distribution::default();
         self.shared_byte_wait = Distribution::default();

@@ -1,0 +1,55 @@
+syntax = "proto3";
+package marketcow.facts.v1;
+import "marketcow/common/v1/types.proto";
+import "marketcow/btc/v3/price.proto";
+import "marketcow/polymarket/btc5m_market_local_v7.proto";
+import "marketcow/facts/v1/common.proto";
+
+message OfficialBookRequest {
+  string request_id = 1;
+  marketcow.polymarket.btc5m.v7.MarketKey key = 2;
+  string stream_id = 3;
+  string token_id = 4;
+  string representation = 5; // typed | raw; required explicit choice.
+}
+message OfficialBook {
+  string market = 1; // Official condition identity.
+  string asset_id = 2;
+  optional int64 supplier_timestamp_ms = 3;
+  optional string supplier_hash = 4; // Opaque official field, never recomputed.
+  repeated marketcow.polymarket.btc5m.v7.PriceLevel bids = 5;
+  repeated marketcow.polymarket.btc5m.v7.PriceLevel asks = 6;
+  optional string min_order_size = 7;
+  optional string tick_size = 8;
+  optional bool neg_risk = 9;
+  optional string last_trade_price = 10;
+}
+message OfficialBookResponse {
+  string schema_version = 1; // marketcow.facts.official-book.v1
+  string request_id = 2;
+  marketcow.common.v1.RecordIdentity identity = 3;
+  DispatchBinding dispatch = 4;
+  UpstreamExchange upstream = 5;
+  string acquisition = 6; // official_rest
+  bool cache_used = 7; // Always false.
+  bool ws_dependency = 8; // No WS freshness/revision dependency; owner binding remains.
+  oneof body { OfficialBook book = 9; bytes raw_body = 10; }
+  optional marketcow.common.v1.EvidenceReference evidence = 11;
+}
+message BtcRestRequest { string request_id = 1; marketcow.common.v1.Source source = 2; }
+message BtcRestResponse {
+  string schema_version = 1; // marketcow.facts.btc-rest.v1
+  string request_id = 2;
+  marketcow.common.v1.RecordIdentity identity = 3;
+  marketcow.common.v1.Source source = 4;
+  string instrument_id = 5;
+  string acquisition = 6; // official_rest
+  bool cache_used = 7;
+  bool ws_dependency = 8;
+  UpstreamExchange upstream = 9;
+  optional marketcow.btc.v3.Trade latest_trade = 10;
+  optional int64 latest_source_age_ms_at_receive = 11; // Signed diagnostic.
+  optional marketcow.common.v1.EvidenceReference evidence = 12;
+}
+// BTC REST has no WS source generation/epoch prerequisite or fallback. Binance
+// uses official recent trades limit=1; Chainlink unsupported, not WS cached TWAP.

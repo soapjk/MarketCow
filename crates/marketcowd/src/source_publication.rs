@@ -26,7 +26,7 @@ use crate::source_market_replay::{MarketPage, MarketReplay};
 use crate::source_market_persistence::{
     Limits as MarketPersistenceLimits, MarketDrainTimeout, MarketPersistence,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 const WS_STATE_CONFIRMATION_MIN_INTERVAL_MS: i64 = 1_000;
 pub(crate) const BTC5M_TRACE_SAMPLE_MODULUS: u64 = 4096;
@@ -486,6 +486,10 @@ struct MarketHealth {
     source_ready: AtomicBool,
     accepting_events: AtomicBool,
     persistence_failed: AtomicBool,
+    // Set by the existing read surface before intake starts. Only standby
+    // admission reads it; normal market publication does not acquire a new
+    // shared lock or depend on a downstream socket.
+    ordinary_handoff_frame_bytes: AtomicUsize,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarketStreamWatermark {
@@ -498,6 +502,7 @@ pub struct MarketStreamWatermark {
 /// One selected market's books and replay boundary captured while holding only
 /// its market lane. It does not clone unrelated markets' depth or claim that
 /// the latest published books are already durable.
+#[derive(Clone)]
 pub struct MarketMemorySnapshot {
     pub watermark: MarketStreamWatermark,
     /// Last event in the selected market's published stream, including
@@ -506,6 +511,9 @@ pub struct MarketMemorySnapshot {
     pub last_market_event_cursor: u64,
     pub market: Option<Arc<Value>>,
     pub books: BTreeMap<String, Arc<Value>>,
+    /// Supplier trade clock, independent of the depth quote clock. A seed
+    /// may carry a last price without evidence of the trade's actual time.
+    pub trade_source_times: BTreeMap<String, String>,
     pub physical_book_cursors: BTreeMap<String, u64>,
     /// Cursor of the source event that installed this book. This is the
     /// recovery snapshot identity, not a physical archive offset and not the
@@ -530,6 +538,7 @@ struct MarketReadState {
     last_event_cursor: u64,
     market: Option<Arc<Value>>,
     books: BTreeMap<String, Arc<Value>>,
+    trade_source_times: BTreeMap<String, String>,
     book_exchanges: BTreeMap<String, DateTime<Utc>>,
     physical_book_cursors: BTreeMap<String, u64>,
     event_book_cursors: BTreeMap<String, u64>,
@@ -588,6 +597,7 @@ impl MarketReadState {
                         let token = token.as_str().context("terminal token identity")?;
                         ensure!(next.token_ids.contains(token), "terminal token outside market binding");
                         next.books.remove(token);
+                        next.trade_source_times.remove(token);
                         next.market_book_cursors.remove(token);
                         next.physical_book_cursors.remove(token);
                         next.event_book_cursors.remove(token);
@@ -614,6 +624,19 @@ impl MarketReadState {
                     }
                     if let Some(exchange_at) = exchange_at {
                         next.book_exchanges.insert(token_id.clone(), exchange_at);
+                    }
+                    if event["raw_payload"]["event_type"] == "last_trade_price" {
+                        if let Some(at) = event["exchange_at"].as_str() {
+                            DateTime::parse_from_rfc3339(at).context("supplier trade clock")?;
+                            next.trade_source_times.insert(token_id.clone(),at.to_owned());
+                        } else {
+                            next.trade_source_times.remove(&token_id);
+                        }
+                    } else if event["raw_payload"]["event_type"] == "book"
+                        || model["last_trade_price"].is_null() {
+                        // Full supplier seeds do not prove the last trade's
+                        // timestamp. Never assign their book timestamp to it.
+                        next.trade_source_times.remove(&token_id);
                     }
                     if clear_confirmation || next.books.get(&token_id).is_some_and(|old|
                         old["book_epoch"] != model["book_epoch"]
@@ -681,6 +704,12 @@ pub struct PublicReplay {
     pub confirmation_books: Vec<Arc<Value>>,
 }
 impl MemoryReader {
+    pub(crate) fn configure_ordinary_handoff_frame_bytes(&self, bytes: usize) -> Result<()> {
+        ensure!((4 * 1024..=2 * 1024 * 1024).contains(&bytes),
+            "ordinary handoff frame budget");
+        self.market_health.ordinary_handoff_frame_bytes.store(bytes,Ordering::Release);
+        Ok(())
+    }
     pub fn subscribe_market(&self, market_id: &str, stream_epoch: &str) -> Result<watch::Receiver<u64>> {
         self.market_replay.subscribe(market_id, stream_epoch)
     }
@@ -711,6 +740,7 @@ impl MemoryReader {
                 },
                 last_market_event_cursor: state.last_event_cursor,
                 market: state.market.clone(), books: selected(&state.books, token_ids),
+                trade_source_times: selected(&state.trade_source_times, token_ids),
                 physical_book_cursors: selected(&state.physical_book_cursors, token_ids),
                 event_book_cursors: selected(&state.event_book_cursors, token_ids),
                 market_book_cursors: selected(&state.market_book_cursors, token_ids),
@@ -1344,6 +1374,7 @@ impl Publication {
             source_ready: AtomicBool::new(true),
             accepting_events: AtomicBool::new(true),
             persistence_failed: AtomicBool::new(false),
+            ordinary_handoff_frame_bytes: AtomicUsize::new(2 * 1024 * 1024),
         });
         let worker_health = market_health.clone();
         let retirement_queue = market_persistence.clone();
@@ -2185,6 +2216,9 @@ impl Publication {
 }
 
 impl MarketPublisher {
+    pub(super) fn ordinary_handoff_frame_bytes(&self) -> usize {
+        self.health.ordinary_handoff_frame_bytes.load(Ordering::Acquire)
+    }
     pub(super) fn confirm_reduced_token(
         &self,
         market: &str,
@@ -2603,9 +2637,20 @@ impl MarketPublisher {
         &self,
         validated: ValidatedSourceBatch,
         materialized_books: BTreeMap<u64, Value>,
+        prepared: PreparedProjection,
+        evidence: Option<Value>,
+        timing: Option<SourceBatchTiming>,
+    ) -> Result<Arc<Batch>> {
+        self.publish_before(validated,materialized_books,prepared,evidence,timing,None)
+    }
+    pub(super) fn publish_before(
+        &self,
+        validated: ValidatedSourceBatch,
+        materialized_books: BTreeMap<u64, Value>,
         mut prepared: PreparedProjection,
         evidence: Option<Value>,
         timing: Option<SourceBatchTiming>,
+        handoff_deadline: Option<DateTime<Utc>>,
     ) -> Result<Arc<Batch>> {
         let actor_events = validated.events();
         let market = actor_events.first().and_then(|event| event["market_id"].as_str())
@@ -2673,8 +2718,13 @@ impl MarketPublisher {
             |state| {
                 ensure!(self.health.accepting_events.load(Ordering::Acquire),
                     "source acquisition paused");
-                state.as_ref().context("market projection absent")?
-                    .prepare_native_group(&market, next_group, batch.validated.events(), actions)
+                let next=state.as_ref().context("market projection absent")?
+                    .prepare_native_group(&market, next_group, batch.validated.events(), actions)?;
+                // This is the final fallible preparation under the selected
+                // market lane, before replay/state/persistence effects commit.
+                ensure!(handoff_deadline.is_none_or(|deadline|Utc::now()<deadline),
+                    "handoff supplier state expired before publication commit");
+                Ok(next)
             },
             |state, next| {
                 *state = Some(next);
@@ -2690,8 +2740,10 @@ impl MarketPublisher {
             // No writer owns this group's post-state. The live projection has
             // already installed its Arc; retaining a second writer-only copy
             // would unnecessarily consume the bounded replay allowance.
+            // Publication has already committed. Cleanup cannot turn a
+            // successful handoff into an ambiguous/rejected transaction.
             batch.materialized_books.lock()
-                .map_err(|_| anyhow::anyhow!("materialized books poisoned"))?.take();
+                .unwrap_or_else(|poisoned| poisoned.into_inner()).take();
             let count = self.volatile_groups.fetch_add(1, Ordering::AcqRel) + 1;
             if !was_volatile || count % 256 == 0 {
                 marketcow_polymarket::async_eprintln!("{}", json!({

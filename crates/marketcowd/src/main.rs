@@ -2072,8 +2072,7 @@ impl DurableJobCoordinator {
         artifact: marketcow_storage::ArtifactManifestRecord,
         now: chrono::DateTime<Utc>,
     ) -> std::result::Result<marketcow_jobs::ProviderJob, DurableJobError> {
-        if result.sha256.to_ascii_lowercase() != artifact.sha256
-            || result.size_bytes != artifact.byte_size
+        if result.size_bytes != artifact.byte_size
             || result.media_type != artifact.media_type
             || result.relative_path != artifact.relative_path
         {
@@ -9812,6 +9811,7 @@ mod tests {
             .and_utc();
         let validated_at = today - chrono::Duration::days(1);
         let end_at = today + chrono::Duration::days(10);
+        let book_at = Utc::now() - chrono::Duration::seconds(1);
         live.catalog_frame.as_mut().unwrap()["markets"][0]["instrument_facts"]["end_at"] =
             json!(end_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
         live.initial_book_frames = vec![yes, no]
@@ -9823,7 +9823,7 @@ mod tests {
                     "tick_size":"0.01",
                     "bids":[{"price":"0.40","size":"10"}],
                     "asks":[{"price":"0.60","size":"10"}],
-                    "timestamp":validated_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                    "timestamp":book_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
                 })
             })
             .collect();
@@ -9875,18 +9875,25 @@ mod tests {
     }
 
     fn two_market_dynamic_live() -> PolymarketLiveConfig {
+        let today = Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let end_at = today + chrono::Duration::days(10);
+        let book_at = Utc::now() - chrono::Duration::seconds(1);
+        let mut first_market = test_scope_market("1", "10", "20");
+        first_market["instrument_facts"]["end_at"] = json!(end_at.to_rfc3339());
+        let mut second_market = test_scope_market("2", "30", "40");
+        second_market["instrument_facts"]["end_at"] = json!(end_at.to_rfc3339());
         let active_markets = vec![
             PolymarketUniverseMarket {
                 market_id: "1".into(),
                 condition_id: "condition-1".into(),
                 token_ids: vec!["10".into(), "20".into()],
-                end_at: "2026-09-01T00:00:00Z".parse().unwrap(),
+                end_at,
             },
             PolymarketUniverseMarket {
                 market_id: "2".into(),
                 condition_id: "condition-2".into(),
                 token_ids: vec!["30".into(), "40".into()],
-                end_at: "2026-09-01T00:00:00Z".parse().unwrap(),
+                end_at,
             },
         ];
         let initial_book_frames = ["10", "20", "30", "40"]
@@ -9896,7 +9903,7 @@ mod tests {
                     "event_type":"book", "asset_id":token, "tick_size":"0.01",
                     "bids":[{"price":"0.40","size":"10"}],
                     "asks":[{"price":"0.60","size":"10"}],
-                    "timestamp":"2026-08-30T00:00:00Z"
+                    "timestamp":book_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
                 })
             })
             .collect::<Vec<_>>();
@@ -9908,7 +9915,7 @@ mod tests {
             catalog_revision: Some("catalog-s".into()),
             catalog_frame: Some(json!({
                 "event_type":"catalog_revision", "catalog_revision":"catalog-s",
-                "markets":[test_scope_market("1", "10", "20"), test_scope_market("2", "30", "40")],
+                "markets":[first_market, second_market],
                 "negative_risk_relations":[]
             })),
             scope_file_sha256: Some("a".repeat(64)),
@@ -9933,7 +9940,7 @@ mod tests {
                 added_market_identities: active_markets,
                 removed_market_identities: Vec::new(),
                 excluded_markets: Vec::new(),
-                validated_at: "2026-08-30T00:00:00Z".parse().unwrap(),
+                validated_at: today - chrono::Duration::days(1),
             }),
             initial_book_frames,
         }

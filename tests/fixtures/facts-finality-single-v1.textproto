@@ -1,0 +1,59 @@
+schema_version: "marketcow.facts.finality.v1"
+request_id: "fixture-request-finality"
+meta {
+  identity { id: "fixture-finality-record" revision: 1 }
+  key {
+    market_id: "600001"
+    condition_id: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    window_id: "btc-updown-5m-1792023000"
+    start_at: "2026-10-15T00:00:00Z"
+    end_at: "2026-10-15T00:05:00Z"
+    up_token_id: "1"
+    down_token_id: "2"
+    rules { id: "fixture-rules" revision: 1 }
+  }
+  observed_at_ns: 1792023400000000000
+}
+status: "verified_final"
+policy: "parallel_two_endpoints_at_least_one_valid_finalized_no_conflict_v2"
+provider_reads_requested: 2
+provider_reads_completed_before_decision: true
+valid_provider_count: 1
+decision_strategy: "wait_both_bounded_reads_no_late_commit"
+providers {
+  provider_id: "fixture-provider-a"
+  operator_id: "fixture-operator-a"
+  failure_domain: "fixture-domain-a"
+  configuration { id: "fixture-rpc-config-a" revision: 1 }
+  status: "valid_resolved"
+  block {
+    hash: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    number: "100"
+  }
+  observed_at_ns: 1792023399000000000
+  chain_id: "137"
+  ctf_address: "0x1111111111111111111111111111111111111111"
+  collateral: "0x2222222222222222222222222222222222222222"
+  payouts { token_id: "1" numerator: "1" }
+  payouts { token_id: "2" numerator: "0" }
+  denominator: "1"
+  token_binding_verified: true
+  deployment_code_verified: true
+  endpoint_identity_verified: true
+}
+providers {
+  provider_id: "fixture-provider-b"
+  operator_id: "fixture-operator-b"
+  failure_domain: "fixture-domain-b"
+  configuration { id: "fixture-rpc-config-b" revision: 1 }
+  status: "timed_out"
+  reason: "provider_read_timeout"
+}
+payouts { token_id: "1" numerator: "1" }
+payouts { token_id: "2" numerator: "0" }
+denominator: "1"
+settlement_import_allowed: true
+durable: true
+durable_sequence: 17
+identity_assurance: "registry_bound_https_operator_endpoints"
+per_provider_deadline_ms: 15000

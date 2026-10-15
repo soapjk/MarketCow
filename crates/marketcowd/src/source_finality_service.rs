@@ -1,4 +1,4 @@
-//! Durable two-provider CTF finality quorum served by the unified MarketCow process.
+//! Durable CTF finality: two bounded parallel reads, at least one verified result.
 //!
 //! RPC endpoints stay in mode-0600 profile files. Provider reads are bounded and
 //! execute on the blocking pool, while publication is memory-first and disk
@@ -31,11 +31,11 @@ use tokio::{
 };
 use url::Url;
 
-const PROFILE_CAP: usize = 16 * 1024;
+const PROFILE_CAP: usize = 96 * 1024;
 const TOKEN_CAP: usize = 4 * 1024;
 const RECORD_CAP: usize = 1024 * 1024;
 const VERIFIED_RESPONSE_CAP: usize = RECORD_CAP;
-const RPC_RESPONSE_CAP: usize = 32 * 1024;
+const RPC_RESPONSE_CAP: usize = 64 * 1024;
 const RPC_TOTAL_CAP: usize = 128 * 1024;
 const RPC_CALLS: usize = 11;
 const OPERATOR_REGISTRY_SCHEMA: &str = "marketcow.rpc.operator-endpoint-registry.v1";
@@ -135,6 +135,7 @@ struct Provider {
     proxy: Option<Url>,
     reader: ReaderProfile,
     collateral: String,
+    deployment_code: Option<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -184,7 +185,10 @@ struct ProfileWire {
     proxy_url: Option<String>,
     chain_id: String,
     contract: String,
+    #[serde(default)]
     code_sha256: String,
+    #[serde(default)]
+    deployment_code_hex: Option<String>,
     finality_policy: String,
     collateral: String,
     adapter_mode: String,
@@ -216,7 +220,7 @@ impl Drop for InflightGuard {
 impl Service {
     pub async fn start(config: Config) -> Result<Self> {
         config.validate()?;
-        let providers = [
+        let mut providers = [
             load_profile(&config.profile_paths[0])?,
             load_profile(&config.profile_paths[1])?,
         ];
@@ -241,6 +245,28 @@ impl Service {
         tokio::fs::set_permissions(&config.root, std::fs::Permissions::from_mode(0o700)).await?;
         let path = config.root.join("verified-final.jsonl");
         let runtime = recover(&path, config.archive_bytes)?;
+        // Preserve an existing operator registration through the transport
+        // migration. Only already-recovered durable verified receipts with the
+        // exact original profile identity can supply these deployment bytes;
+        // never learn the expected code from a new, unverified RPC response.
+        for provider in &mut providers {
+            if provider.deployment_code.is_some(){continue;}
+            let mut registered:Option<Vec<u8>>=None;
+            for fact in runtime.durable_verified.values() {
+                for row in fact["provider_observations"].as_array().into_iter().flatten() {
+                    if row["provider_id"]!=provider.provider_id || row["profile_sha256"]!=provider.profile_sha256
+                        || row["observation"]["chain_id"]!=provider.reader.chain_id
+                        || row["observation"]["ctf_address"]!=provider.reader.contract {continue;}
+                    let raw=row["observation"]["evidence"][2]["raw_utf8"].as_str().context("registered deployment evidence missing")?;
+                    let response:Value=serde_json::from_str(raw)?;
+                    let code=hex::decode(response["result"].as_str().and_then(|v|v.strip_prefix("0x")).context("registered deployment bytes missing")?)?;
+                    ensure!(!code.is_empty()&&code.len()<=24*1024,"registered deployment capacity");
+                    ensure!(registered.as_ref().is_none_or(|prior|prior==&code),"registered deployment conflict");
+                    registered=Some(code);
+                }
+            }
+            provider.deployment_code=registered;
+        }
         let (writer, receiver) = mpsc::channel(config.queue_records);
         let shared = Arc::new(Shared {
             state: RwLock::new(runtime),
@@ -262,12 +288,106 @@ impl Service {
                 "/v1/prediction-markets/polymarket/finality/status",
                 get(status),
             )
-            .route(
-                "/v1/prediction-markets/polymarket/finality/verified",
-                get(verified),
-            )
             .with_state(self.shared.clone())
     }
+    pub fn native_router(&self,control:crate::source_btc5m_api::Control)->Router {
+        Router::new().route("/v1/facts/polymarket/finality",axum::routing::post(native_verified))
+            .layer(axum::extract::DefaultBodyLimit::max(64*1024))
+            .with_state((self.shared.clone(),control))
+    }
+}
+
+async fn native_verified(
+    State((shared,control)):State<(Arc<Shared>,crate::source_btc5m_api::Control)>,
+    headers:HeaderMap,body:Result<axum::body::Bytes,axum::extract::rejection::BytesRejection>,
+)->Response {
+    use crate::source_facts_rest::{decode,Failed,response};
+    use marketcow_contracts::typed_v3::facts;
+    use prost::Message;
+    if !authorized(&shared,&headers){return Failed::local("","finality_unauthorized",401).into_response();}
+    let request:facts::MarketRequest=match decode(&headers,body){Ok(v)=>v,Err(e)=>return e.into_response()};
+    let key=match crate::source_facts_typed::validate_request(&request){Ok(k)=>k.clone(),Err(_)=>return Failed::local(&request.request_id,"invalid_identity",400).into_response()};
+    let c=control.clone();let k=key.clone();
+    let cached=tokio::task::spawn_blocking(move||->Result<_>{c.validate_native_key(&k)?;c.native_finality(&k,None)}).await;
+    match cached {
+        Ok(Ok(Some(mut value)))=>{value.request_id=request.request_id;return response(200,&value,"marketcow.facts.v1.FinalityResponse",None);}
+        Ok(Ok(None))=>{},
+        _=>return Failed::local(&request.request_id,"finality_store_or_identity_unavailable",503).into_response(),
+    }
+    let Ok(_permit)=shared.clients.clone().try_acquire_owned() else{return Failed::local(&request.request_id,"finality_capacity",503).into_response()};
+    let query=FinalityQuery{market_id:key.market_id.clone(),condition_id:key.condition_id.clone(),up_token:key.up_token_id.clone(),down_token:key.down_token_id.clone()};
+    let (binding_key,tokens)=match validate_query(&query){Ok(v)=>v,Err(_)=>return Failed::local(&request.request_id,"invalid_identity",400).into_response()};
+    if !shared.inflight.lock().await.insert(binding_key.clone()){return Failed::local(&request.request_id,"finality_read_inflight",503).into_response();}
+    let _guard=InflightGuard{shared:shared.clone(),key:binding_key.clone()};
+    {
+        let mut attempts=shared.attempts.lock().await;
+        if attempts.get(&binding_key).is_some_and(|t|t.elapsed()<shared.config.retry_after){return Failed::local(&request.request_id,"finality_retry_limited",429).into_response();}
+        attempts.insert(binding_key,Instant::now());
+    }
+    let mut configurations=Vec::with_capacity(2);
+    for provider in &shared.providers {
+        let mut config=Vec::new();
+        for field in [&provider.provider_id,&provider.operator_id,&provider.failure_domain,&provider.reader.chain_id,&provider.reader.contract,&provider.collateral,&provider.reader.finality_policy] {
+            config.extend_from_slice(&(field.len() as u32).to_be_bytes());config.extend_from_slice(field.as_bytes());
+        }
+        if let Some(code)=&provider.deployment_code {config.extend_from_slice(code);}
+        let c=control.clone();let id=provider.provider_id.clone();
+        match tokio::task::spawn_blocking(move||c.native_fact_record("finality_provider",id.as_bytes(),&config)).await {
+            Ok(Ok(value))=>configurations.push(value),
+            _=>return Failed::local(&request.request_id,"finality_configuration_store_failed",503).into_response(),
+        }
+    }
+    let binding=TokenBinding{collateral:shared.providers[0].collateral.clone(),token_ids_hex:tokens};
+    if binding.collateral!=shared.providers[1].collateral{return Failed::local(&request.request_id,"finality_profile_disagreement",503).into_response();}
+    let (left,right)=tokio::join!(
+        observe_provider_mode(shared.providers[0].clone(),key.condition_id.clone(),binding.clone(),shared.config.request_timeout,true),
+        observe_provider_mode(shared.providers[1].clone(),key.condition_id.clone(),binding,shared.config.request_timeout,true));
+    let providers=std::array::from_fn(|index|native_provider(&shared.providers[index],&key,configurations[index].clone(),if index==0{&left}else{&right}));
+    let Some(now)=Utc::now().timestamp_nanos_opt() else{return Failed::local(&request.request_id,"clock_unavailable",503).into_response()};
+    let c=control.clone();let k=key.clone();
+    let identity=match tokio::task::spawn_blocking(move||c.native_fact_record("finality_binding",&k.encode_to_vec(),&k.encode_to_vec())).await {
+        Ok(Ok(v))=>v,_=>return Failed::local(&request.request_id,"finality_store_failed",503).into_response(),
+    };
+    let meta=facts::FactMeta{identity:Some(identity),key:Some(key.clone()),observed_at_ns:now,evidence:Vec::new()};
+    let value=match crate::source_facts_typed::decide_finality(&request,meta,providers,None,shared.config.request_timeout.as_millis() as u32){
+        Ok(v)=>v,Err(_)=>return Failed::local(&request.request_id,"finality_observation_invalid",502).into_response(),
+    };
+    let (status,mut value)=if value.status=="awaiting_durability" {
+        let c=control;let k=key;
+        match tokio::task::spawn_blocking(move||c.native_finality(&k,Some(value))).await {
+            Ok(Ok(Some(v)))=>(200,v),_=>return Failed::local(&request.request_id,"finality_persistence_failed",503).into_response(),
+        }
+    } else {(match value.status.as_str(){"conflict"=>409,"provider_failed"=>503,_=>202},value)};
+    value.request_id=request.request_id;
+    response(status,&value,"marketcow.facts.v1.FinalityResponse",None)
+}
+
+fn native_provider(provider:&Provider,key:&marketcow_contracts::typed_v3::market::MarketKey,
+    configuration:marketcow_contracts::typed_v3::common::RecordIdentity,result:&Result<Value>)
+    ->marketcow_contracts::typed_v3::facts::FinalityProvider {
+    use marketcow_contracts::typed_v3::facts;
+    let mut row=facts::FinalityProvider{provider_id:provider.provider_id.clone(),operator_id:provider.operator_id.clone(),failure_domain:provider.failure_domain.clone(),configuration:Some(configuration),status:"failed".into(),..Default::default()};
+    let value=match result {Ok(v)=>v,Err(error)=>{
+        let (status,reason)=if provider.deployment_code.is_none(){("invalid","deployment_code_registration_missing")}
+            else if error.chain().any(|e|e.to_string().contains("deadline")){("timed_out","provider_deadline")}
+            else{("failed","provider_read_failed")};
+        row.status=status.into();row.reason=Some(reason.into());return row;
+    }};
+    let parsed=(||->Result<()>{
+        let block=&value["block"];
+        let number=u128::from_str_radix(block["number"].as_str().context("block number")?.trim_start_matches("0x"),16)?;
+        let seconds=i64::from_str_radix(block["timestamp"].as_str().context("block time")?.trim_start_matches("0x"),16)?;
+        row.block=Some(facts::FinalizedBlock{hash:block["hash"].as_str().context("block hash")?.into(),number:number.to_string(),source_time_ms:Some(seconds.checked_mul(1000).context("block time range")?)});
+        row.observed_at_ns=chrono::DateTime::parse_from_rfc3339(value["observed_at"].as_str().context("observed time")?)?.timestamp_nanos_opt();
+        row.chain_id=Some(provider.reader.chain_id.clone());row.ctf_address=Some(provider.reader.contract.clone());row.collateral=Some(provider.collateral.clone());
+        row.denominator=Some(value["payout_denominator"].as_str().context("denominator")?.into());
+        row.payouts=vec![facts::TokenPayout{token_id:key.up_token_id.clone(),numerator:value["payout_numerators"][0].as_str().context("up payout")?.into()},facts::TokenPayout{token_id:key.down_token_id.clone(),numerator:value["payout_numerators"][1].as_str().context("down payout")?.into()}];
+        row.token_binding_verified=value["standard_ctf_token_binding_verified"]==true;
+        row.deployment_code_verified=true;row.endpoint_identity_verified=true;
+        row.status=if row.denominator.as_deref()==Some("0"){"unresolved"}else{"valid_resolved"}.into();Ok(())
+    })();
+    if parsed.is_err(){row.status="invalid".into();row.reason=Some("provider_observation_invalid".into());}
+    row
 }
 
 fn operator_registry_entry_value(entry: &OperatorRegistryEntry) -> Value {
@@ -366,13 +486,17 @@ fn load_profile(path: &Path) -> Result<Provider> {
         "finality collateral identity"
     );
     ensure!(
-        wire.code_sha256.len() == 64
+        wire.deployment_code_hex.is_some() || wire.code_sha256.len() == 64
             && wire
                 .code_sha256
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit()),
         "finality code identity"
     );
+    let deployment_code=wire.deployment_code_hex.map(|value|->Result<Vec<u8>>{
+        let bytes=hex::decode(value.strip_prefix("0x").context("deployment code prefix")?)?;
+        ensure!(!bytes.is_empty() && bytes.len()<=24*1024,"deployment code capacity");Ok(bytes)
+    }).transpose()?;
     Ok(Provider {
         provider_id: wire.provider_id,
         operator_id: wire.operator_id,
@@ -390,6 +514,7 @@ fn load_profile(path: &Path) -> Result<Provider> {
             maximum_bytes: RPC_TOTAL_CAP,
         },
         collateral: wire.collateral,
+        deployment_code,
     })
 }
 
@@ -626,7 +751,8 @@ async fn verified(
     };
     {
         let state = shared.state.read().await;
-        if let Some(value) = state.durable_verified.get(&key) {
+        if let Some(value) = state.durable_verified.get(&key).filter(|value|
+            value["schema_version"] == "marketcow.polymarket.verified-final.v2") {
             if !matches!(
                 serde_json::to_vec(value),
                 Ok(encoded) if encoded.len() <= VERIFIED_RESPONSE_CAP
@@ -708,13 +834,10 @@ async fn verified(
         shared.config.request_timeout,
     );
     let (left, right) = tokio::join!(left, right);
-    let observations = match (left, right) {
-        (Ok(left), Ok(right)) => vec![left, right],
-        (left, right) => {
-            let observations = [left.ok(), right.ok()]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
+    // Join both bounded reads before committing. No detached late result can
+    // change an already published payout; failure of one provider is not a gate.
+    let observations = [left.ok(), right.ok()].into_iter().flatten().collect::<Vec<_>>();
+    if observations.is_empty() {
             let attempt_observed_at = timestamp();
             let fact = pending_fact(
                 &query,
@@ -736,8 +859,7 @@ async fn verified(
                 "provider_read_failed",
                 Some(first_observed_at),
             );
-        }
-    };
+    }
     let fact = match quorum_fact(&query, &key, &first_observed_at, &observations) {
         Ok(value) => value,
         Err(code) => {
@@ -757,7 +879,9 @@ async fn verified(
                     Some(first_observed_at),
                 );
             }
-            return failure(StatusCode::ACCEPTED, code, Some(first_observed_at));
+            return failure(if code == "finality_provider_disagreement" {
+                StatusCode::CONFLICT
+            } else { StatusCode::ACCEPTED }, code, Some(first_observed_at));
         }
     };
     match publish(&shared, key, fact).await {
@@ -804,6 +928,11 @@ async fn observe_provider(
     binding: TokenBinding,
     timeout: Duration,
 ) -> Result<Value> {
+    observe_provider_mode(provider,condition,binding,timeout,false).await
+}
+async fn observe_provider_mode(provider:Provider,condition:String,binding:TokenBinding,
+    timeout:Duration,native:bool)->Result<Value> {
+    if native {ensure!(provider.deployment_code.is_some(),"deployment_code_registration_missing");}
     tokio::task::spawn_blocking(move || {
         let mut builder = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -816,7 +945,7 @@ async fn observe_provider(
         let deadline = Instant::now() + timeout;
         let mut total = 0usize;
         let endpoint = provider.endpoint.clone();
-        let observation = reader::read_bound(&provider.reader, &condition, &binding, |request| {
+        let mut transport = |request:&Value| {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .filter(|remaining| !remaining.is_zero())
@@ -827,7 +956,7 @@ async fn observe_provider(
                 .timeout(remaining.min(Duration::from_secs(10)))
                 .json(request)
                 .send()
-                .map_err(|_| anyhow::anyhow!("RPC transport failed"))?;
+                .map_err(|error| if error.is_timeout(){anyhow::anyhow!("RPC deadline")}else{anyhow::anyhow!("RPC transport failed")})?;
             ensure!(response.status().is_success(), "RPC HTTP failure");
             let mut raw = Vec::new();
             response
@@ -838,7 +967,12 @@ async fn observe_provider(
             total = total.checked_add(raw.len()).context("RPC byte overflow")?;
             ensure!(total <= RPC_TOTAL_CAP, "RPC total capacity");
             Ok(raw)
-        })?;
+        };
+        let observation=if native {
+            reader::read_bound_native(&provider.reader,&condition,&binding,
+                provider.deployment_code.as_deref().context("deployment_code_registration_missing")?,&mut transport)?
+        } else {reader::read_bound(&provider.reader,&condition,&binding,&mut transport)?};
+        if native{return Ok(observation);}
         let observation_sha256 = sha(&serde_json::to_vec(&observation)?);
         let endpoint_origin = endpoint.origin().ascii_serialization();
         Ok(json!({
@@ -930,9 +1064,29 @@ fn quorum_fact(
     first_observed_at: &str,
     observations: &[Value],
 ) -> std::result::Result<Value, &'static str> {
-    if observations.len() != 2 || observations[0]["provider_id"] == observations[1]["provider_id"] {
-        return Err("independent_provider_quorum_required");
+    if observations.is_empty() || observations.len() > 2
+        || (observations.len() == 2 && observations[0]["provider_id"] == observations[1]["provider_id"]) {
+        return Err("valid_provider_observation_required");
     }
+    let mut last_invalid = "finality_observation_unresolved_or_invalid";
+    let observations = observations.iter().filter(|row| {
+        let value = &row["observation"];
+        if value["schema_version"] != "marketcow.polymarket.ctf-observation.v1"
+            || value["condition_id"] != query.condition_id
+            || value["status"] != "resolved_unverified"
+            || value["settlement_import_allowed"] != false
+            || value["standard_ctf_token_binding_verified"] != true
+        { return false; }
+        if validate_observation(value).is_err()
+            || row["observation_sha256"] != sha(&serde_json::to_vec(value).unwrap_or_default())
+        { last_invalid = "finality_observation_invalid"; return false; }
+        if !provider_identity_is_runtime_verified(row) {
+            last_invalid = "two_gateway_matching_observations";
+            return false;
+        }
+        true
+    }).cloned().collect::<Vec<_>>();
+    if observations.is_empty() { return Err(last_invalid); }
     let values = observations
         .iter()
         .map(|row| &row["observation"])
@@ -958,7 +1112,7 @@ fn quorum_fact(
             "bound_tokens":value["bound_tokens"]
         })
     };
-    if agreement(values[0]) != agreement(values[1]) {
+    if values.len() == 2 && agreement(values[0]) != agreement(values[1]) {
         return Err("finality_provider_disagreement");
     }
     if !observations
@@ -986,10 +1140,10 @@ fn quorum_fact(
         })
         .collect::<Vec<_>>();
     let verified_at = timestamp();
-    validate_finality_timeline(first_observed_at, &verified_at, observations)
+    validate_finality_timeline(first_observed_at, &verified_at, &observations)
         .map_err(|_| "finality_observation_time_invalid")?;
     Ok(json!({
-        "schema_version":"marketcow.polymarket.verified-final.v1",
+        "schema_version":"marketcow.polymarket.verified-final.v2",
         "event_type":"polymarket_verified_final",
         "binding_key":key,
         "market_id":query.market_id,
@@ -1004,7 +1158,11 @@ fn quorum_fact(
         "ctf_address":values[0]["ctf_address"],
         "collateral":values[0]["collateral"],
         "status":"verified_final",
-        "finality_policy":"two_independent_operator_endpoints_finalized_receipts_v1",
+        "finality_policy":"parallel_two_endpoints_at_least_one_valid_finalized_no_conflict_v2",
+        "provider_reads_requested":2,
+        "provider_reads_completed_before_decision":true,
+        "valid_provider_count":observations.len(),
+        "decision_strategy":"wait_both_bounded_reads_no_late_commit",
         "identity_assurance":"registry_bound_https_operator_endpoints",
         "identity_assurance_boundary":"concrete upstream, cloud, region and physical host are not asserted",
         "first_observed_at":first_observed_at,
@@ -1109,11 +1267,15 @@ fn pending_fact(
 }
 
 fn validate_verified_fact(value: &Value) -> Result<()> {
+    // Existing immutable archive records are verified under their original
+    // assurance, never relabelled or served as new v2 receipts.
+    let historical = value["schema_version"] == "marketcow.polymarket.verified-final.v1";
     ensure!(
-        value["schema_version"] == "marketcow.polymarket.verified-final.v1"
+        (historical || value["schema_version"] == "marketcow.polymarket.verified-final.v2")
             && value["status"] == "verified_final"
             && value["finality_policy"]
-                == "two_independent_operator_endpoints_finalized_receipts_v1"
+                == if historical { "two_independent_operator_endpoints_finalized_receipts_v1" }
+                else { "parallel_two_endpoints_at_least_one_valid_finalized_no_conflict_v2" }
             && value["identity_assurance"] == "registry_bound_https_operator_endpoints"
             && value["settlement_import_allowed"] == true,
         "verified final schema"
@@ -1121,7 +1283,13 @@ fn validate_verified_fact(value: &Value) -> Result<()> {
     let observations = value["provider_observations"]
         .as_array()
         .context("verified observations")?;
-    ensure!(observations.len() == 2, "verified provider quorum");
+    ensure!(if historical { observations.len() == 2 }
+        else { (1..=2).contains(&observations.len())
+            && value["valid_provider_count"] == observations.len()
+            && value["provider_reads_requested"] == 2
+            && value["provider_reads_completed_before_decision"] == true
+            && value["decision_strategy"] == "wait_both_bounded_reads_no_late_commit" },
+        "verified provider count/policy");
     validate_finality_timeline(
         value["first_observed_at"]
             .as_str()
@@ -1142,6 +1310,20 @@ fn validate_verified_fact(value: &Value) -> Result<()> {
             "verified observation digest"
         );
         validate_observation(observation)?;
+    }
+    if !historical {
+        let query = FinalityQuery {
+            market_id: value["market_id"].as_str().context("market")?.to_owned(),
+            condition_id: value["condition_id"].as_str().context("condition")?.to_owned(),
+            up_token: value["ordered_outcomes"][0]["token_id"].as_str().context("up")?.to_owned(),
+            down_token: value["ordered_outcomes"][1]["token_id"].as_str().context("down")?.to_owned(),
+        };
+        let regenerated = quorum_fact(&query, value["binding_key"].as_str().context("binding")?,
+            value["first_observed_at"].as_str().context("first")?, observations)
+            .map_err(|code| anyhow::anyhow!(code))?;
+        ensure!(same_verified(value, &regenerated)
+            && value["provider_receipts"] == regenerated["provider_receipts"],
+            "verified payout/receipts mismatch");
     }
     Ok(())
 }
@@ -1455,7 +1637,7 @@ mod tests {
         assert!(validate_verified_fact(&inverted).is_err());
         assert_eq!(
             verified["finality_policy"],
-            "two_independent_operator_endpoints_finalized_receipts_v1"
+            "parallel_two_endpoints_at_least_one_valid_finalized_no_conflict_v2"
         );
         let gateway_left = provider_observation(0, &query, false);
         let gateway_right = provider_observation(1, &query, false);
@@ -1469,10 +1651,31 @@ mod tests {
             Err("two_gateway_matching_observations")
         );
         right["observation"]["payout_numerators"] = json!(["0", "1"]);
+        right["observation_sha256"] = json!(sha(&serde_json::to_vec(&right["observation"]).unwrap()));
+        right["provider_identity_evidence"]["observation_sha256"] = right["observation_sha256"].clone();
         assert_eq!(
             quorum_fact(&query, &key, "2026-01-01T00:00:00.000Z", &[left, right],),
             Err("finality_provider_disagreement")
         );
+    }
+
+    #[test]
+    fn single_valid_finality_and_invalid_peer_do_not_require_quorum() {
+        let query = query();
+        let key = validate_query(&query).unwrap().0;
+        let good = provider_observation(0, &query, true);
+        let single = quorum_fact(&query, &key, "2026-01-01T00:00:00.000Z", &[good.clone()]).unwrap();
+        assert_eq!(single["schema_version"], "marketcow.polymarket.verified-final.v2");
+        assert_eq!(single["valid_provider_count"], 1);
+        assert_eq!(single["provider_receipts"].as_array().unwrap().len(), 1);
+        validate_verified_fact(&single).unwrap();
+        let mut unresolved = provider_observation(1, &query, true);
+        unresolved["observation"]["status"] = json!("unresolved");
+        let fact = quorum_fact(&query, &key, "2026-01-01T00:00:00.000Z", &[good, unresolved]).unwrap();
+        assert_eq!(fact["valid_provider_count"], 1);
+        let mut tampered = fact;
+        tampered["provider_receipts"][0]["block_hash"] = json!("forged");
+        assert!(validate_verified_fact(&tampered).is_err());
     }
 
     #[test]

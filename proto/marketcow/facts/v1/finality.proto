@@ -1,0 +1,53 @@
+syntax = "proto3";
+package marketcow.facts.v1;
+import "marketcow/common/v1/types.proto";
+import "marketcow/facts/v1/common.proto";
+
+message FinalizedBlock {
+  string hash = 1; // External chain identity, opaque; no local hash computation.
+  string number = 2; // Canonical unsigned base-10 integer, not a JS float.
+  optional int64 source_time_ms = 3;
+}
+message TokenPayout { string token_id = 1; string numerator = 2; }
+message FinalityProvider {
+  string provider_id = 1;
+  string operator_id = 2;
+  string failure_domain = 3;
+  marketcow.common.v1.RecordIdentity configuration = 4;
+  string status = 5; // valid_resolved | unresolved | failed | timed_out | invalid
+  optional string reason = 6;
+  optional FinalizedBlock block = 7;
+  optional int64 observed_at_ns = 8;
+  optional string chain_id = 9;
+  optional string ctf_address = 10;
+  optional string collateral = 11;
+  repeated TokenPayout payouts = 12; // Exact ordered Up, Down.
+  optional string denominator = 13;
+  bool token_binding_verified = 14;
+  bool deployment_code_verified = 15;
+  bool endpoint_identity_verified = 16;
+  repeated marketcow.common.v1.EvidenceReference evidence = 17;
+}
+message FinalityResponse {
+  string schema_version = 1; // marketcow.facts.finality.v1
+  string request_id = 2;
+  FactMeta meta = 3;
+  string status = 4; // verified_final | unresolved | provider_failed | conflict | awaiting_durability
+  string policy = 5;
+  uint32 provider_reads_requested = 6; // Exactly 2.
+  bool provider_reads_completed_before_decision = 7;
+  uint32 valid_provider_count = 8;
+  string decision_strategy = 9;
+  repeated FinalityProvider providers = 10; // Exactly 2 distinct requested endpoints.
+  repeated TokenPayout payouts = 11; // Present only after conflict-free decision.
+  optional string denominator = 12;
+  bool settlement_import_allowed = 13;
+  bool durable = 14;
+  optional uint64 durable_sequence = 15;
+  optional string reason = 16;
+  string identity_assurance = 17;
+  uint32 per_provider_deadline_ms = 18; // Existing configured 5000..120000 budget.
+}
+// Wait for BOTH concurrently started bounded reads, including timeout/failure.
+// One valid resolved result suffices; two valid resolved results must agree.
+// Never return first-success then commit a contradictory late result.

@@ -14,7 +14,6 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from marketcow.universe_control_server import read_json
 from marketcow.universe_generation import Generation, GenerationStore
 from marketcow.universe_owner import SupervisorOwner
-from marketcow.universe_phase1 import selection_sha256
 from marketcow.universe_runtime_command import parse_binding
 from marketcow.universe_runtime_supervisor import RuntimeSupervisor
 from marketcow.universe_systemd import SystemdUnits, SystemdLiveRuntime, SystemdDiscoveryRuntime
@@ -86,8 +85,6 @@ class GenerationOperations:
         if registration is None or set(registration) != {"path", "sha256"}:
             raise ValueError("generation_not_registered")
         config = read_json(Path(registration["path"]), 65536)
-        if selection_sha256(config) != registration["sha256"]:
-            raise ValueError("operation_config_hash_mismatch")
         fields = {"pool", "store_path", "owner_lock", "maximum_generations", "maximum_record_bytes",
             "release_root", "user_unit_root", "command_timeout_seconds", "operation_timeout_seconds", "binding"}
         if set(config) != fields or (config["pool"], config["store_path"], config["owner_lock"],

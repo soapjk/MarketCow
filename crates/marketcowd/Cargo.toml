@@ -20,6 +20,10 @@ path = "src/discovery_collector.rs"
 name = "marketcow-live-source-bridge"
 path = "src/live_source_bridge.rs"
 
+[[bin]]
+name = "marketcow-btc-db-migrate"
+path = "src/btc_observation_migrate.rs"
+
 [dependencies]
 anyhow.workspace = true
 rusqlite.workspace = true
@@ -46,16 +50,17 @@ serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
 rust_decimal.workspace = true
 reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
+rustls.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
+tempfile.workspace = true
 uuid.workspace = true
 url.workspace = true
 
 [dev-dependencies]
 futures-util.workspace = true
-tempfile.workspace = true
 tokio-tungstenite.workspace = true

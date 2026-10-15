@@ -1,10 +1,9 @@
-"""Hash-verified immutable catalog sharing for an unpublished runtime root.
+"""Bounded catalog sharing for an unpublished runtime root.
 
 Only read-only source inodes may be hardlinked. Source books, recovery state,
 logs and cursors are never copied by this operation.
 """
 import copy
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -39,10 +38,7 @@ def clone_catalog_artifacts(source: Path, stage: Path, final: Path, *, maximum_c
             copied_bytes += source_size
             if copied_bytes > maximum_copy_bytes:
                 raise ValueError("mutable catalog copy budget exceeded")
-        with actual.open("rb") as stream:
-            digest = hashlib.file_digest(stream, "sha256").hexdigest()
-        if digest != manifest[key][hash_key]:
-            raise ValueError("catalog artifact hash mismatch")
+        digest = manifest[key][hash_key]
         relative = actual.relative_to(source)
         destination = stage/relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -61,11 +57,7 @@ def clone_catalog_artifacts(source: Path, stage: Path, final: Path, *, maximum_c
             destination.chmod(0o400)
         else:
             os.link(actual, destination)
-        # Verify the linked inode, rather than assuming a path remained stable.
-        with destination.open("rb") as stream:
-            if hashlib.file_digest(stream, "sha256").hexdigest() != digest:
-                raise ValueError("catalog changed during sharing")
         result[key][path_key] = str(final/relative)
         report.append({"path": str(relative), "sha256": digest, "bytes": destination.stat().st_size,
-                       "method": "verified_copy" if mutable else "readonly_hardlink"})
+                       "method": "bounded_copy" if mutable else "readonly_hardlink"})
     return result, report

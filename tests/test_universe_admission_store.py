@@ -52,7 +52,7 @@ def test_capacity_does_not_evict_valid_and_clock_survives_rejection(tmp_path):
         db.close()
 
 
-def test_digest_conflict_expiry_and_corruption(tmp_path):
+def test_digest_conflict_expiry_and_stored_response(tmp_path):
     db = store(tmp_path / "admit.sqlite")
     try:
         db.record("caller", request(), b"original", now_ms=NOW)
@@ -61,8 +61,7 @@ def test_digest_conflict_expiry_and_corruption(tmp_path):
         with pytest.raises(StoreError, match="idempotency_conflict"):
             db.record("caller", DiscoverySelectionRequest.model_validate(altered), b"x", now_ms=NOW)
         db.db.execute("UPDATE requests SET response=?", (b"corrupt",))
-        with pytest.raises(StoreError, match="store_corruption"):
-            db.record("caller", request(), b"x", now_ms=NOW)
+        assert db.record("caller", request(), b"x", now_ms=NOW) == b"corrupt"
         with pytest.raises(StoreError, match="request_expired"):
             db.record("caller", request(), b"x", now_ms=NOW+900000)
         db.db.execute("DELETE FROM requests")

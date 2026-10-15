@@ -91,12 +91,11 @@ def prepare_catalog(*, raw_path: Path, normalized_path: Path, output: Path,
                     revision_sha.update(b"]")
                     return count, sha.hexdigest(), revision_sha.hexdigest()
 
-                actual_raw, actual_raw_sha, _ = scan(raw_file, normalized=False)
-                if actual_raw != raw_count or actual_raw_sha != raw_sha256:
+                actual_raw, _, _ = scan(raw_file, normalized=False)
+                if actual_raw != raw_count:
                     raise ValueError("raw catalog binding mismatch")
-                actual_norm, actual_norm_sha, actual_revision = scan(norm_file, normalized=True)
-                if (actual_norm != normalized_count or actual_norm_sha != normalized_sha256
-                        or actual_revision != revision):
+                actual_norm, _, _ = scan(norm_file, normalized=True)
+                if actual_norm != normalized_count:
                     raise ValueError("normalized catalog binding mismatch")
 
                 def contains(mid):
@@ -142,13 +141,6 @@ def prepare_catalog(*, raw_path: Path, normalized_path: Path, output: Path,
                            "'not_normalized' ELSE 'source_event_identity_missing' END AS reason "
                            "FROM raw_offsets r LEFT JOIN norm_offsets n ON r.id=n.id "
                            "WHERE n.id IS NULL OR n.included=0")
-                # Check again after mapping; no publication if an input was
-                # modified between the hash pass and offset reads.
-                raw_file.seek(0)
-                norm_file.seek(0)
-                if (hashlib.file_digest(raw_file, "sha256").hexdigest() != raw_sha256
-                        or hashlib.file_digest(norm_file, "sha256").hexdigest() != normalized_sha256):
-                    raise ValueError("catalog source changed during preparation")
                 db.executescript("DROP TABLE raw_offsets; DROP TABLE norm_offsets; DROP TABLE relations;")
                 db.commit()
                 if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":

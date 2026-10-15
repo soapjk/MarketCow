@@ -36,7 +36,7 @@ pub fn read<F>(profile: &Profile, condition: &str, transport: F) -> Result<Value
 where
     F: FnMut(&Value) -> Result<Vec<u8>>,
 {
-    read_inner(profile, condition, None, transport)
+    read_inner(profile, condition, None, None, transport)
 }
 pub fn read_bound<F>(
     profile: &Profile,
@@ -56,12 +56,23 @@ where
         !binding.token_ids_hex[0].eq_ignore_ascii_case(&binding.token_ids_hex[1]),
         "duplicate token"
     );
-    read_inner(profile, condition, Some(binding), transport)
+    read_inner(profile, condition, Some(binding), None, transport)
+}
+/// Native data path compares the registered deployment bytes directly. It
+/// never computes a content digest and never accepts a digest as byte proof.
+pub fn read_bound_native<F>(profile:&Profile,condition:&str,binding:&TokenBinding,
+    expected_code:&[u8],transport:F)->Result<Value>
+where F:FnMut(&Value)->Result<Vec<u8>> {
+    ensure!(!expected_code.is_empty() && expected_code.len()<=24*1024,"deployment_code_registration_missing");
+    ensure!(hex_field(&binding.collateral,40) && binding.token_ids_hex.iter().all(|s|hex_field(s,64))
+        && binding.token_ids_hex[0]!=binding.token_ids_hex[1],"token_binding_invalid");
+    read_inner(profile,condition,Some(binding),Some(expected_code),transport)
 }
 fn read_inner<F>(
     profile: &Profile,
     condition: &str,
     binding: Option<&TokenBinding>,
+    expected_code: Option<&[u8]>,
     mut transport: F,
 ) -> Result<Value>
 where
@@ -76,7 +87,7 @@ where
         "unsupported finality policy"
     );
     ensure!(
-        !profile.chain_id.is_empty() && profile.code_sha256.len() == 64,
+        !profile.chain_id.is_empty() && (expected_code.is_some() || profile.code_sha256.len() == 64),
         "profile missing"
     );
     let mut evidence = vec![];
@@ -103,7 +114,9 @@ where
             .get("result")
             .context("RPC result missing")?
             .clone();
-        evidence.push(json!({"request":request,"raw_sha256":hex::encode(Sha256::digest(&raw)),"raw_bytes":raw.len(),"raw_utf8":std::str::from_utf8(&raw)?}));
+        let mut row=json!({"request":request,"raw_bytes":raw.len(),"raw_utf8":std::str::from_utf8(&raw)?});
+        if expected_code.is_none(){row["raw_sha256"]=json!(hex::encode(Sha256::digest(&raw)));}
+        evidence.push(row);
         Ok(result)
     };
     ensure!(
@@ -126,10 +139,12 @@ where
         .strip_prefix("0x")
         .context("code prefix")?;
     let code = hex::decode(code)?;
-    ensure!(
-        !code.is_empty() && hex::encode(Sha256::digest(&code)) == profile.code_sha256,
-        "deployment code mismatch"
-    );
+    ensure!(!code.is_empty(),"deployment code absent");
+    if let Some(expected)=expected_code {
+        ensure!(code==expected,"deployment code mismatch");
+    } else {
+        ensure!(hex::encode(Sha256::digest(&code))==profile.code_sha256,"deployment code mismatch");
+    }
     let mut abi = |selector: &str, suffix: &str| -> Result<Value> {
         call(
             "eth_call",
@@ -192,6 +207,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_rpc_uses_registered_bytes_without_content_hash_fields() {
+        let mut p=profile();p.code_sha256.clear();p.maximum_calls=11;
+        let binding=TokenBinding{collateral:format!("0x{}","3".repeat(40)),token_ids_hex:[format!("0x{}","e".repeat(64)),format!("0x{}","f".repeat(64))]};
+        let condition=format!("0x{}","a".repeat(64));
+        let read=|code:&[u8]|read_bound_native(&p,&condition,&binding,code,|q| {
+            let i=q["id"].as_u64().unwrap() as usize;
+            let value=match i {8|10=>json!(format!("0x{}","b".repeat(64))),9=>json!(binding.token_ids_hex[0]),11=>json!(binding.token_ids_hex[1]),_=>result(i)};
+            Ok(serde_json::to_vec(&json!({"jsonrpc":"2.0","id":i,"result":value}))?)
+        });
+        let value=read(&[1]).unwrap();assert_eq!(value["standard_ctf_token_binding_verified"],true);
+        assert!(value["evidence"].as_array().unwrap().iter().all(|r|r.get("raw_sha256").is_none()));
+        assert!(read(&[2]).is_err());
+    }
     fn profile() -> Profile {
         Profile {
             chain_id: "0x89".into(),

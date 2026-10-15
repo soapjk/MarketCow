@@ -3,20 +3,20 @@
 //! hash preimage or a second live state machine.
 
 use anyhow::{Context, Result, bail, ensure};
-use marketcow_contracts::btc5m_market_local_v3::{encode_frame, wire};
+use marketcow_contracts::btc5m_market_local_v5::{encode_frame, wire};
 use serde::{Serialize, Serializer, ser::{SerializeMap, SerializeSeq}};
 use serde_json::Value;
 use marketcow_runtime::discovery_source::DurableMarketGroup;
-use sha2::{Digest, Sha256};
 
-// Encode the validated source event without cloning its raw and canonical
-// payload trees. Keys are sorted recursively, and the top-level event_id is
-// excluded from its own commitment.
-// A digest equality check below also rejects any unexpected JSON key-ordering
-// behavior before a noncanonical preimage could reach the protobuf feed.
+// The wire carries this preimage for consumers; constructing it does not
+// recompute or compare a digest.
 struct SourceEventPreimage<'a>(&'a Value);
 
 struct CanonicalValue<'a>(&'a Value);
+
+pub(crate) fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&CanonicalValue(value))?)
+}
 
 impl Serialize for CanonicalValue<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
@@ -134,11 +134,11 @@ pub(crate) fn market_event(value: &Value) -> Result<wire::MarketEvent> {
     use wire::market_event::Payload;
     let payload = value.get("canonical_payload").context("missing canonical payload")?;
     let preimage = serde_json::to_vec(&SourceEventPreimage(value))?;
-    ensure!(hex::encode(Sha256::digest(&preimage)) == required_string(value, "event_id")?,
-        "source event preimage differs from event identity");
     let event_type = required_string(value, "event_type")?;
     let body = match event_type {
         "book" => match payload.get("payload_semantics").and_then(Value::as_str) {
+            None if value["raw_payload"]["event_type"] == "marketcow_connection_checkpoint" =>
+                Payload::ConnectionCheckpointBook(canonical_book(payload)?),
             None => Payload::BookSnapshot(canonical_book(payload)?),
             Some("ordered_depth_delta_with_complete_post_state_commitment") => {
                 let changes = payload["delta"]["changes"].as_array()
@@ -241,40 +241,29 @@ pub(crate) fn encode_market_group(
     identity: &wire::MarketIdentity, market_cursor: u64, group_sha256: &str,
     events: &[Value], maximum_frame_bytes: usize,
 ) -> Result<Vec<Vec<u8>>> {
+    use prost::Message as _;
     use wire::market_stream_frame::Body;
     ensure!(!events.is_empty() && market_cursor > 0 && identity.stream_epoch.is_some(),
         "market group identity/events");
     let group_hash = hash32(group_sha256)?;
     let typed = events.iter().map(market_event).collect::<Result<Vec<_>>>()?;
-    let mut ranges = vec![(0, typed.len())];
-    let frame = |body| wire::MarketStreamFrame { identity: Some(identity.clone()), body: Some(body) };
-    let mut index = 0;
-    while index < ranges.len() {
-        let (start, end) = ranges[index];
-        let candidate = frame(Body::GroupChunk(wire::MarketGroupChunk {
-            market_cursor, group_sha256: group_hash.clone(),
-            chunk_index: u32::MAX, chunk_count: u32::MAX,
-            events: typed[start..end].to_vec(),
-        }));
-        if encode_frame(&candidate, maximum_frame_bytes).is_ok() {
-            index += 1;
-        } else {
-            ensure!(end - start > 1, "single market event exceeds protobuf frame budget");
-            let middle = start + (end - start) / 2;
-            ranges.splice(index..=index, [(start, middle), (middle, end)]);
-        }
-    }
     let event_count = u32::try_from(typed.len())?;
-    let chunk_count = u32::try_from(ranges.len())?;
-    let mut frames = Vec::with_capacity(ranges.len() + 2);
+    let encoded = wire::MarketEventBundle {events:typed}.encode_to_vec();
+    ensure!(encoded.len() <= 32*1024*1024, "market group encoded byte budget");
+    let part_bytes = maximum_frame_bytes.checked_sub(512)
+        .filter(|bytes|*bytes > 0).context("market group frame budget")?;
+    let frame = |body| wire::MarketStreamFrame { identity: Some(identity.clone()), body: Some(body) };
+    let chunk_count = u32::try_from(encoded.len().div_ceil(part_bytes))?;
+    let mut frames = Vec::with_capacity(chunk_count as usize + 2);
     frames.push(encode_frame(&frame(Body::GroupBegin(wire::MarketGroupBegin {
         market_cursor, group_sha256: group_hash.clone(), event_count, chunk_count,
+        encoded_bytes:encoded.len() as u64,
     })), maximum_frame_bytes)?);
-    for (chunk_index, (start, end)) in ranges.into_iter().enumerate() {
+    for (chunk_index, part) in encoded.chunks(part_bytes).enumerate() {
         frames.push(encode_frame(&frame(Body::GroupChunk(wire::MarketGroupChunk {
             market_cursor, group_sha256: group_hash.clone(),
             chunk_index: u32::try_from(chunk_index)?, chunk_count,
-            events: typed[start..end].to_vec(),
+            encoded_events_part: part.to_vec(),
         })), maximum_frame_bytes)?);
     }
     frames.push(encode_frame(&frame(Body::GroupCommit(wire::MarketGroupCommit {

@@ -1,0 +1,52 @@
+schema_version: "marketcow.facts.execution.v1"
+request_id: "fixture-request-execution"
+meta {
+  identity { id: "fixture-execution-record" revision: 1 }
+  key {
+    market_id: "600001"
+    condition_id: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    window_id: "btc-updown-5m-1792023000"
+    start_at: "2026-10-15T00:00:00Z"
+    end_at: "2026-10-15T00:05:00Z"
+    up_token_id: "1"
+    down_token_id: "2"
+    rules { id: "fixture-rules" revision: 1 }
+  }
+  observed_at_ns: 1792023000000000000
+}
+source: "polymarket_clob_v2"
+source_url: "https://clob.polymarket.com/clob-markets/0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+instrument {
+  price_increment: "0.01"
+  minimum_order_size: "5"
+  price_unit: "probability"
+  size_unit: "shares"
+  missing_fields: "size_increment"
+}
+fees {
+  model: "clob_v2_dynamic"
+  taker_rate: "0.25"
+  exponent: 2
+  taker_only: true
+  maker_base_fee_bps: "0"
+  taker_base_fee_bps: "0"
+  missing_fields: "currency"
+  missing_fields: "maker_rate"
+  missing_fields: "quantum"
+  missing_fields: "rounding_mode"
+  missing_fields: "effective_at"
+  applicability: "fd.r/fd.e/fd.to; base-fee fields preserved, not used for dynamic fee"
+}
+order_execution {
+  taker_order_delay_enabled: false
+  missing_fields: "marketable_hold_ms"
+}
+explicit_policies {
+  identity { id: "fixture-operator-fee-policy" revision: 1 }
+  origin: "operator_configuration"
+  purpose: "explicit_conservative_execution_policy"
+  fee_currency: "USDC"
+  fee_quantum: "0.00001"
+  rounding_mode: "ROUND_UP"
+  fee_upper_bound_method: "SOURCE_RATE_UPPER_BOUND_PLUS_QUANTUM"
+}
