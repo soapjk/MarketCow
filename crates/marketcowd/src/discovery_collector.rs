@@ -21,7 +21,16 @@ mod source_acquisition_shards;
 #[allow(dead_code)]
 mod source_btc5m_api;
 mod source_market_live;
-mod source_market_preimage;
+mod source_market_live_v7;
+mod source_facts_typed;
+mod source_facts_identity;
+mod source_facts_rest;
+mod btc_typed;
+mod btc_typed_store;
+mod btc_typed_history;
+mod source_typed_identity;
+mod btc_typed_api;
+mod btc_typed_ingress;
 mod source_market_send_diagnostic;
 mod source_btc5m_reference;
 mod source_btc5m_proto;
@@ -644,12 +653,6 @@ fn replay_pending_retirement(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Explicit offline serializer export; does not start acquisition or read credentials.
-    let raw_args=std::env::args().collect::<Vec<_>>();
-    if raw_args.len()==3 && raw_args[1]=="--emit-market-live-v6-fixture" {
-        std::fs::write(&raw_args[2],serde_json::to_vec_pretty(&source_market_live::serializer_vectors()?)?)?;
-        return Ok(());
-    }
     marketcow_polymarket::diagnostic::install();
     let args = Args::parse();
     if let Some(output) = &args.offline_cold_output {
@@ -1321,6 +1324,10 @@ async fn main() -> Result<()> {
             router = router.merge(source_official_ws_relay::router(
                 control.clone(), publication.reader(),
             )?);
+            router=router.merge(source_market_evidence::native_router(control.clone())?);
+            if let Some(service)=&finality_service {
+                router=router.merge(service.native_router(control.clone()));
+            }
             if let Some(key_path) = args.btc_polynode_key_file.clone() {
                 let (pn1, archive_rx) = source_polynode_service::Service::new(control.clone())?;
                 polynode_task = Some(pn1.start(key_path,

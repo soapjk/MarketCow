@@ -464,10 +464,69 @@ pub struct Control {
     active: Arc<RwLock<Active>>,
     changed: watch::Sender<u64>,
     manager: Arc<RwLock<Option<Value>>>,
+    rule_store:Arc<Mutex<rusqlite::Connection>>,
+    rule_bindings:Arc<RwLock<BTreeMap<String,marketcow_contracts::typed_v3::market::RulesRecord>>>,
 }
 impl Control {
-    pub fn live_identity(&self, binding: &MarketBinding) -> Result<(marketcow_contracts::btc5m_market_local_v6::wire::MarketKey,String)> {
-        self.live.identity(binding)
+    pub fn register_native_rules(&self,record:marketcow_contracts::typed_v3::market::RulesRecord)->Result<()> {
+        let mut db=self.rule_store.lock().map_err(|_|anyhow::anyhow!("rule store poisoned"))?;
+        let record=crate::source_typed_identity::bind_rules(&mut db,record)?;
+        let mut records=self.rule_bindings.write().map_err(|_|anyhow::anyhow!("rule bindings poisoned"))?;
+        // Current, next, and one reviewed successor; bounded independent of uptime.
+        records.insert(record.market_id.clone(),record);
+        while records.len()>6 {let oldest=records.iter().min_by_key(|(_,r)|r.end_at.clone()).map(|(id,_)|id.clone()).unwrap();records.remove(&oldest);}
+        Ok(())
+    }
+    pub fn native_key(&self,binding:&MarketBinding)->Result<marketcow_contracts::typed_v3::market::MarketKey> {
+        let records=self.rule_bindings.read().map_err(|_|anyhow::anyhow!("rule bindings poisoned"))?;
+        let r=records.get(&binding.market_id).context("rules_not_prepared")?;
+        ensure!(r.condition_id==binding.condition_id && r.window_id==binding.window_id
+            && r.start_at==binding.start_at && r.end_at==binding.end_at
+            && r.up_token_id==binding.outcomes[0].token_id && r.down_token_id==binding.outcomes[1].token_id,"rule_binding_changed");
+        Ok(marketcow_contracts::typed_v3::market::MarketKey{market_id:r.market_id.clone(),condition_id:r.condition_id.clone(),
+            window_id:r.window_id.clone(),start_at:r.start_at.clone(),end_at:r.end_at.clone(),up_token_id:r.up_token_id.clone(),down_token_id:r.down_token_id.clone(),rules:r.identity.clone()})
+    }
+    pub fn native_rules(&self,id:&marketcow_contracts::typed_v3::common::RecordIdentity)->Result<Option<marketcow_contracts::typed_v3::market::RulesRecord>> {
+        let db=self.rule_store.lock().map_err(|_|anyhow::anyhow!("rule store poisoned"))?;
+        crate::source_typed_identity::rules(&db,id)
+    }
+    pub fn native_identity(&self,binding:&MarketBinding)->Result<(marketcow_contracts::typed_v3::market::MarketKey,String)> {
+        self.live.native_identity(binding,self.native_key(binding)?)
+    }
+    pub fn native_fact_record(&self,namespace:&str,business_key:&[u8],payload:&[u8])->Result<marketcow_contracts::typed_v3::common::RecordIdentity> {
+        let mut db=self.rule_store.lock().map_err(|_|anyhow::anyhow!("fact store poisoned"))?;
+        crate::source_facts_identity::initialize(&db)?;
+        crate::source_facts_identity::record(&mut db,namespace,business_key,payload)
+    }
+    pub fn native_finality(&self,key:&marketcow_contracts::typed_v3::market::MarketKey,
+        value:Option<marketcow_contracts::typed_v3::facts::FinalityResponse>)
+        ->Result<Option<marketcow_contracts::typed_v3::facts::FinalityResponse>> {
+        let mut db=self.rule_store.lock().map_err(|_|anyhow::anyhow!("fact store poisoned"))?;
+        crate::source_facts_identity::finality(&mut db,key,value)
+    }
+    pub fn latch_native_baseline(&self,key:&marketcow_contracts::typed_v3::market::MarketKey,instrument:&str,method:&str,price:&str)->Result<String> {
+        let mut db=self.rule_store.lock().map_err(|_|anyhow::anyhow!("fact store poisoned"))?;
+        crate::source_facts_identity::initialize(&db)?;
+        crate::source_facts_identity::latch_baseline(&mut db,key,instrument,method,price)
+    }
+    pub fn validate_native_key(&self,key:&marketcow_contracts::typed_v3::market::MarketKey)->Result<marketcow_contracts::typed_v3::market::RulesRecord> {
+        crate::source_facts_typed::validate_key(key)?;
+        let rules=self.native_rules(key.rules.as_ref().context("rules_missing")?)?.context("rules_not_found")?;
+        ensure!(rules.market_id==key.market_id&&rules.condition_id==key.condition_id&&rules.window_id==key.window_id
+            &&rules.start_at==key.start_at&&rules.end_at==key.end_at&&rules.up_token_id==key.up_token_id&&rules.down_token_id==key.down_token_id,"rule_identity_mismatch");
+        Ok(rules)
+    }
+    pub fn native_dispatch(&self,request:&marketcow_contracts::typed_v3::facts::OfficialBookRequest)->Result<marketcow_contracts::typed_v3::facts::DispatchBinding> {
+        let (profile,_)=self.profile_for_market_source()?;
+        let key=request.key.as_ref().context("missing_market_key")?;
+        let binding=profile.markets.iter().find(|m|m.market_id==key.market_id).context("identity_not_active")?;
+        ensure!(binding.role!=WindowRole::Retiring,"identity_not_active");
+        let (current,stream)=self.native_identity(binding)?;
+        ensure!(&current==key && stream==request.stream_id
+            && (request.token_id==key.up_token_id||request.token_id==key.down_token_id),"identity_not_active");
+        let now=Utc::now();
+        ensure!(DateTime::parse_from_rfc3339(&key.start_at)?<=now&&now<DateTime::parse_from_rfc3339(&key.end_at)?,"identity_not_active");
+        Ok(marketcow_contracts::typed_v3::facts::DispatchBinding{key:Some(current),stream_id:stream,token_id:request.token_id.clone(),identity_checked_at_ns:now.timestamp_nanos_opt().context("clock_unavailable")?})
     }
     pub fn profile_for_market_source(&self) -> Result<(Arc<Profile>, String)> {
         let active = self.active()?;
@@ -692,6 +751,11 @@ impl Api {
             })),
             changed,
             manager: Arc::new(RwLock::new(None)),
+            rule_store:Arc::new(Mutex::new(match &archive_root {
+                Some(root)=>crate::source_typed_identity::open(&root.join("typed-identities.sqlite3"))?,
+                None=>crate::source_typed_identity::memory()?,
+            })),
+            rule_bindings:Arc::new(RwLock::new(BTreeMap::new())),
         };
         let timeline = Arc::new(Mutex::new(TimelineArchive::default()));
         // Diagnostic serialization and bounded retention run off the WS path.
@@ -758,7 +822,6 @@ impl Api {
             send_diagnostics,
             limits,
         };
-        start_live_publication(state.clone());
         Ok((
             Router::new()
                 .route(
@@ -768,21 +831,6 @@ impl Api {
                 .route(
                     "/v1/prediction-markets/polymarket/research/btc-5m/management-health",
                     get(http_management_health),
-                )
-                // The official CLOB WebSocket remains an explicit observation
-                // source. Its market-local v3 cursor and confirmation domain
-                // must never be confused with the PN1 v4 market serial.
-                .route(
-                    "/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-streams",
-                    get(http_live_market_streams),
-                )
-                .route(
-                    "/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-full-sync",
-                    get(http_live_market_full_sync),
-                )
-                .route(
-                    "/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-stream",
-                    get(http_live_market_stream),
                 )
                 .route(
                     "/v1/prediction-markets/polymarket/research/btc-5m/market-timeline",
@@ -796,6 +844,9 @@ impl Api {
                     "/v1/prediction-markets/polymarket/research/market-archive-replay",
                     get(http_market_archive_replay),
                 )
+                .route("/v7/polymarket/btc-5m/market-streams",get(http_native_market_streams))
+                .route("/v7/polymarket/btc-5m/market-stream",get(http_native_market_stream))
+                .route("/v7/polymarket/btc-5m/rules",get(http_native_rules))
                 .with_state(state),
             control,
         ))
@@ -808,176 +859,105 @@ struct MarketFullSyncQuery {
     market_id: String,
 }
 
-fn live_response<T: prost::Message>(document: &T) -> Response {
-    use marketcow_contracts::btc5m_market_local_v6 as live;
-    match live::encode(document,crate::source_market_live::MAX_FRAME_BYTES) {
-        Ok(bytes) => ([("content-type",live::CONTENT_TYPE),("cache-control","no-store")],bytes).into_response(),
-        Err(_) => failure(StatusCode::PAYLOAD_TOO_LARGE,"btc_5m_live_frame_budget",false),
-    }
-}
-async fn http_live_market_streams(State(api):State<Api>) -> Response {
-    use marketcow_contracts::btc5m_market_local_v6::{self as live,wire};
-    let document=(|| -> Result<wire::MarketStreams> {
+async fn http_native_market_streams(State(api):State<Api>)->Response {
+    let document=(||->Result<marketcow_contracts::typed_v3::market::MarketStreams>{
         let active=api.control.active()?;
         api.control.live.retain(&active.profile.markets)?;
-        let markets=active.profile.markets.iter().map(|binding| {
-            let (key,stream_id)=api.control.live_identity(binding)?;
-            Ok(wire::MarketBinding{key:Some(key),stream_id,role:match binding.role {
-                WindowRole::Current=>"current",WindowRole::Next=>"next",WindowRole::Retiring=>"retiring",
-            }.into()})
+        let markets=active.profile.markets.iter().map(|b| {
+            let (key,stream_id)=api.control.native_identity(b)?;
+            Ok(marketcow_contracts::typed_v3::market::MarketBinding{key:Some(key),stream_id,
+                role:match b.role{WindowRole::Current=>"current",WindowRole::Next=>"next",WindowRole::Retiring=>"retiring"}.into()})
         }).collect::<Result<Vec<_>>>()?;
-        ensure!(api.control.active()?.profile.document_sha256()==active.profile.document_sha256(),"discovery changed");
-        Ok(wire::MarketStreams{schema_version:live::SCHEMA_VERSION.into(),markets,
-            delivery_budget:Some(wire::DeliveryBudget {
-                maximum_frame_bytes:crate::source_market_live::MAX_FRAME_BYTES as u64,
-                maximum_state_bytes:crate::source_market_live::MAX_STATE_BYTES as u64,
-                maximum_levels_per_side:crate::source_market_live::MAX_LEVELS as u64,
-                maximum_changes:crate::source_market_live::MAX_CHANGES as u64,
-            })})
+        let after=api.control.active()?;
+        ensure!(Arc::ptr_eq(&active.profile,&after.profile)&&active.epoch==after.epoch,"discovery_changed");
+        crate::source_facts_typed::discovery(markets)
     })();
-    match document {Ok(value)=>live_response(&value),Err(_)=>failure(StatusCode::SERVICE_UNAVAILABLE,"btc_5m_live_discovery_unavailable",true)}
-}
-
-fn start_live_publication(api: Api) {
-    tokio::spawn(async move {
-        let mut ticks = tokio::time::interval(Duration::from_millis(10));
-        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticks.tick().await;
-            let Ok(active) = api.control.active() else {
-                api.control.live.invalidate_all("profile_unavailable");
-                continue;
-            };
-            if api.control.live.retain(&active.profile.markets).is_err() { continue }
-            let mut jobs = tokio::task::JoinSet::new();
-            for binding in active.profile.markets.iter().cloned() {
-                let api = api.clone();
-                jobs.spawn(async move {
-                    match build_live_state(&api,binding.clone()).await {
-                        Ok(state) => { let _ = api.control.live.publish(&binding,state); }
-                        Err(error) => {
-                            let _=api.control.live.invalidate_market(&binding,"publisher_failed");
-                            marketcow_polymarket::async_eprintln!("{}",json!({
-                                "stage":"market_live_publication_failed","market_id":binding.market_id,
-                                "error":format!("{error:#}")}));
-                        },
-                    }
-                });
-            }
-            // At most the three managed markets are in flight. Slow consumers
-            // never create more builders or retain a backlog of snapshots.
-            while jobs.join_next().await.is_some() {}
-        }
-    });
-}
-
-async fn capture_live_state(api:&Api,binding:MarketBinding) -> Result<Arc<crate::source_market_live::LiveState>> {
-    api.control.live.load(&binding)
-}
-
-async fn build_live_state(api:&Api,binding:MarketBinding) -> Result<Arc<crate::source_market_live::LiveState>> {
-    let api=api.clone();
-    tokio::task::spawn_blocking(move || {
-        let active=api.control.active()?;
-        api.control.live.retain(&active.profile.markets)?;
-        let lane=api.control.live.lane(&binding)?;
-        let still_bound=active.profile.markets.iter().any(|b|
-            crate::source_market_live::key(b).ok()==crate::source_market_live::key(&binding).ok());
-        ensure!(still_bound,"immutable market key no longer active");
-        let tokens=binding.outcomes.iter().map(|o|o.token_id.clone()).collect::<Vec<_>>();
-        let ended=Utc::now()>=DateTime::parse_from_rfc3339(&binding.end_at)?.with_timezone(&Utc);
-        let snapshot=api.reader.capture_market(&binding.market_id,&tokens).ok();
-        let mut lane=lane.lock().map_err(|_|anyhow::anyhow!("live lane poisoned"))?;
-        match lane.capture(snapshot.as_ref(),ended) {
-            Ok(state)=>Ok(state),
-            Err(error)=>{
-                marketcow_polymarket::async_eprintln!("{}",json!({"stage":"market_live_state_rejected",
-                    "market_id":binding.market_id,"error":format!("{error:#}")}));
-                lane.reject(snapshot.as_ref(),ended,"state_budget_or_invalid")
-            }
-        }
-    }).await?
-}
-async fn http_live_market_full_sync(State(api):State<Api>,Query(query):Query<MarketFullSyncQuery>) -> Response {
-    let Ok(_permit)=api.snapshots.clone().try_acquire_owned() else {
-        return failure(StatusCode::SERVICE_UNAVAILABLE,"btc_5m_snapshot_capacity",true);
-    };
-    let binding=api.control.active().ok().and_then(|a|a.profile.markets.iter()
-        .find(|b|b.market_id==query.market_id).cloned());
-    let Some(binding)=binding else {return failure(StatusCode::NOT_FOUND,"btc_5m_market_not_in_profile",false);};
-    match capture_live_state(&api,binding).await.and_then(|state|crate::source_market_live::frame(&state,None)) {
-        Ok(document)=>live_response(&document),
-        Err(_)=>failure(StatusCode::SERVICE_UNAVAILABLE,"btc_5m_live_snapshot_unavailable",true),
-    }
+    match document{Ok(v)=>crate::btc_typed_api::encoded(&v,64*1024),Err(_)=>crate::btc_typed_api::failure(StatusCode::SERVICE_UNAVAILABLE,"market_discovery_unavailable",true)}
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LiveStreamQuery {market_id:String,stream_id:String}
-async fn http_live_market_stream(State(api):State<Api>,Query(query):Query<LiveStreamQuery>,
-    peer:Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
-    headers:HeaderMap,ws:WebSocketUpgrade) -> Response {
-    use marketcow_contracts::btc5m_market_local_v6 as live;
-    if !headers.get(axum::http::header::SEC_WEBSOCKET_PROTOCOL).and_then(|h|h.to_str().ok())
-        .is_some_and(|h|h.split(',').any(|s|s.trim()==live::SUBPROTOCOL)) {
-        return failure(StatusCode::UPGRADE_REQUIRED,"btc_5m_proto_subprotocol_required",false);
+struct NativeRulesQuery{rules_id:String,revision:u64}
+async fn http_native_rules(State(api):State<Api>,query:Result<Query<NativeRulesQuery>,axum::extract::rejection::QueryRejection>)->Response {
+    let Ok(Query(q))=query else{return crate::btc_typed_api::failure(StatusCode::BAD_REQUEST,"invalid_request",false)};
+    if q.rules_id.is_empty()||q.revision==0{return crate::btc_typed_api::failure(StatusCode::BAD_REQUEST,"invalid_request",false);}
+    match tokio::task::spawn_blocking(move||api.control.native_rules(&marketcow_contracts::typed_v3::common::RecordIdentity{id:q.rules_id,revision:q.revision})).await {
+        Ok(Ok(Some(rules)))=>crate::btc_typed_api::encoded(&rules,512*1024),
+        Ok(Ok(None))=>crate::btc_typed_api::failure(StatusCode::NOT_FOUND,"rules_not_found",false),
+        _=>crate::btc_typed_api::failure(StatusCode::SERVICE_UNAVAILABLE,"rules_unavailable",true),
     }
-    let Ok(active)=api.control.active() else {return failure(StatusCode::SERVICE_UNAVAILABLE,"btc_5m_unavailable",true);};
-    let Some(binding)=active.profile.markets.iter().find(|b|b.market_id==query.market_id).cloned() else {
-        return failure(StatusCode::NOT_FOUND,"btc_5m_market_not_in_profile",false);
+}
+async fn capture_native_state(api:&Api,binding:MarketBinding)->Result<Arc<crate::source_market_live_v7::State>> {
+    let api=api.clone();
+    tokio::task::spawn_blocking(move|| {
+        let active=api.control.active()?;
+        api.control.live.retain(&active.profile.markets)?;
+        ensure!(active.profile.markets.iter().any(|b|b.market_id==binding.market_id
+            && b.condition_id==binding.condition_id&&b.window_id==binding.window_id&&b.start_at==binding.start_at
+            &&b.end_at==binding.end_at&&b.outcomes==binding.outcomes&&b.rule_sha256==binding.rule_sha256),"identity_not_active");
+        let key=api.control.native_key(&binding)?;
+        let tokens=binding.outcomes.iter().map(|o|o.token_id.clone()).collect::<Vec<_>>();
+        let snapshot=api.reader.capture_market(&binding.market_id,&tokens).ok();
+        let ended=Utc::now()>=DateTime::parse_from_rfc3339(&binding.end_at)?.with_timezone(&Utc);
+        api.control.live.capture_native(&binding,key,snapshot.as_ref(),ended)
+    }).await?
+}
+async fn http_native_market_stream(State(api):State<Api>,query:Result<Query<LiveStreamQuery>,axum::extract::rejection::QueryRejection>,
+    peer:Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,headers:HeaderMap,
+    ws:Result<WebSocketUpgrade,axum::extract::ws::rejection::WebSocketUpgradeRejection>)->Response {
+    use marketcow_contracts::typed_v3 as native;
+    let Ok(Query(query))=query else{return crate::btc_typed_api::failure(StatusCode::BAD_REQUEST,"invalid_request",false)};
+    let Ok(ws)=ws else{return crate::btc_typed_api::failure(StatusCode::BAD_REQUEST,"invalid_websocket_upgrade",false)};
+    if !headers.get(axum::http::header::SEC_WEBSOCKET_PROTOCOL).and_then(|h|h.to_str().ok())
+        .is_some_and(|h|h.split(',').any(|s|s.trim()==native::MARKET_SUBPROTOCOL)) {
+        return crate::btc_typed_api::failure(StatusCode::UPGRADE_REQUIRED,"typed_subprotocol_required",false);
+    }
+    let Ok(active)=api.control.active()else{return crate::btc_typed_api::failure(StatusCode::SERVICE_UNAVAILABLE,"market_unavailable",true)};
+    let Some(binding)=active.profile.markets.iter().find(|b|b.market_id==query.market_id).cloned()else {
+        return crate::btc_typed_api::failure(StatusCode::CONFLICT,"identity_not_active",false);
     };
-    if api.control.live.retain(&active.profile.markets).is_err()
-        || !api.control.live_identity(&binding).is_ok_and(|(_,id)|id==query.stream_id) {
-        return failure(StatusCode::CONFLICT,"btc_5m_live_stream_changed",false);
+    if !api.control.native_identity(&binding).is_ok_and(|(_,id)|id==query.stream_id) {
+        return crate::btc_typed_api::failure(StatusCode::CONFLICT,"identity_not_active",false);
     }
     let slots={
-        let Ok(mut slots)=api.market_stream_slots.lock() else {return failure(StatusCode::SERVICE_UNAVAILABLE,"btc_5m_stream_capacity",true);};
+        let Ok(mut slots)=api.market_stream_slots.lock() else{return crate::btc_typed_api::failure(StatusCode::SERVICE_UNAVAILABLE,"market_stream_capacity",true)};
         slots.retain(|id,_|active.profile.markets.iter().any(|b|&b.market_id==id));
         slots.entry(query.market_id.clone()).or_insert_with(||Arc::new(Semaphore::new(market_stream_client_limit(api.limits.clients)))).clone()
     };
-    let Ok(market_permit)=slots.try_acquire_owned() else {return failure(StatusCode::SERVICE_UNAVAILABLE,"btc_5m_market_stream_capacity",true);};
-    let Ok(permit)=api.streams.clone().try_acquire_owned() else {return failure(StatusCode::SERVICE_UNAVAILABLE,"btc_5m_stream_capacity",true);};
-    ws.protocols([live::SUBPROTOCOL]).max_message_size(4096).max_frame_size(4096).on_upgrade(move |socket|async move {
+    let Ok(market_permit)=slots.try_acquire_owned() else{return crate::btc_typed_api::failure(StatusCode::SERVICE_UNAVAILABLE,"market_stream_capacity",true)};
+    let Ok(permit)=api.streams.clone().try_acquire_owned()else{return crate::btc_typed_api::failure(StatusCode::SERVICE_UNAVAILABLE,"market_stream_capacity",true)};
+    ws.protocols([native::MARKET_SUBPROTOCOL]).max_message_size(4096).max_frame_size(4096).on_upgrade(move|socket|async move {
         let (_permit,_market_permit)=(permit,market_permit);
         let mut socket=MarketClientIo::new(socket);
         socket.peer=peer.map(|axum::Extension(axum::extract::ConnectInfo(addr))|addr);
         socket.diagnostics=Some(api.send_diagnostics.clone());
-        api.send_diagnostics.record(json!({"stage":"market_send_connection","observed_at":Utc::now(),
-            "connection_id":socket.connection_id,"peer":socket.peer,"market_id":query.market_id,
-            "stream_id":query.stream_id,"schema_version":live::SCHEMA_VERSION}));
         let result=async {
-            let mut previous:Option<Arc<crate::source_market_live::LiveState>>=None;
-            let mut changed=api.control.live.subscribe(&binding)?;
-            changed.mark_changed();
-            loop {
-                tokio::select! {
-                    message=socket.controls.recv()=> {if socket.handle_control(message,api.limits.send_timeout).await? {break;}}
-                    notification=changed.changed()=>{
-                        notification.context("public market retired")?;
-                        let state=capture_live_state(&api,binding.clone()).await?;
-                        ensure!(state.stream_id==query.stream_id,"public stream recreated");
-                        if previous.as_ref().is_some_and(|old|old.sequence==state.sequence) {continue;}
-                        // Net differences are always based on the last fully flushed state.
-                        // Private source replacement chooses an ordinary snapshot, not a control protocol.
-                        let frame=crate::source_market_live::frame(&state,previous.as_deref())?;
-                        let bytes=live::encode(&frame,crate::source_market_live::MAX_FRAME_BYTES)?;
-                        socket.in_flight_cursor=Some(state.sequence);
-                        send_market_frame(&mut socket,&api,bytes).await?;
-                        socket.last_complete_cursor=state.sequence;socket.in_flight_cursor=None;
-                        let ended=state.snapshot.source_status=="ended";
-                        previous=Some(state);
-                        if ended {break;}
-                    }
+            let mut previous:Option<Arc<crate::source_market_live_v7::State>>=None;
+            let mut tick=tokio::time::interval(Duration::from_millis(10));tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {tokio::select! {
+                control=socket.controls.recv()=>{if socket.handle_control(control,api.limits.send_timeout).await?{break;}},
+                _=tick.tick()=>{
+                    let state=capture_native_state(&api,binding.clone()).await?;
+                    ensure!(state.stream_id==query.stream_id,"public_stream_changed");
+                    if previous.as_ref().is_some_and(|p|p.sequence==state.sequence){continue;}
+                    let message=crate::source_market_live_v7::frame(&state,previous.as_deref(),Utc::now().to_rfc3339())?;
+                    let bytes=native::encode(&message,crate::source_market_live_v7::MAX_BYTES)?;
+                    socket.in_flight_cursor=Some(state.sequence);
+                    send_market_frame(&mut socket,&api,bytes).await?;
+                    socket.last_complete_cursor=state.sequence;socket.in_flight_cursor=None;
+                    let ended=state.snapshot.source_status=="ended";previous=Some(state);
+                    if ended{break;}
                 }
-            }
-            Ok::<_,anyhow::Error>(())
+            }} Ok::<_,anyhow::Error>(())
         }.await;
-        if let Err(error)=result {marketcow_polymarket::async_eprintln!("{}",json!({
-            "stage":"btc_5m_live_stream_closed","observed_at":Utc::now(),"market_id":query.market_id,
-            "stream_id":query.stream_id,"connection_id":socket.connection_id,"last_state_sequence":socket.last_complete_cursor,
-            "error":format!("{error:#}")}));}
+        if let Err(error)=result{marketcow_polymarket::async_eprintln!("{}",json!({"stage":"btc_5m_native_stream_closed","market_id":query.market_id,
+            "stream_id":query.stream_id,"connection_id":socket.connection_id,"last_state_sequence":socket.last_complete_cursor,"error":format!("{error:#}")}));}
         let _=tokio::time::timeout(api.limits.send_timeout,socket.send(Message::Close(None))).await;
     })
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveStreamQuery {market_id:String,stream_id:String}
+
 fn proto_market_identity(active: &Active, binding: &MarketBinding,
     stream_epoch: Option<&str>) -> proto::MarketIdentity {
     proto::MarketIdentity {
@@ -2383,51 +2363,48 @@ fn confirmation_wait(
 
 #[cfg(test)]
 mod tests {
-    #[tokio::test]
-    async fn v6_formal_routes_emit_ordinary_snapshot_and_preserve_role_identity() {
-        use prost::Message as _;
-        use futures_util::{SinkExt,StreamExt};
-        use marketcow_contracts::btc5m_market_local_v6::{self as live,wire};
-        use tokio_tungstenite::tungstenite::{client::IntoClientRequest,Message as ClientMessage};
-        let publication=crate::source_publication::Publication::start(0,None,BTreeMap::new(),
-            8,131072,65536,|_|Ok(())).unwrap();
-        let (router,control)=Api::router(publication.reader(),profile(),"epoch".into(),Limits {
-            live_backlog_groups:8,live_backlog_age:Duration::from_millis(100),snapshot_bytes:65536,
-            frame_bytes:4096,replay_bytes:65536,clients:3,send_timeout:Duration::from_secs(1),snapshot_lease_capacity:1,
+    fn register_test_rules(control: &super::Control, binding: &super::MarketBinding) {
+        control.register_native_rules(marketcow_contracts::typed_v3::market::RulesRecord {
+            market_id: binding.market_id.clone(), condition_id: binding.condition_id.clone(),
+            window_id: binding.window_id.clone(), start_at: binding.start_at.clone(),
+            end_at: binding.end_at.clone(), up_token_id: binding.outcomes[0].token_id.clone(),
+            down_token_id: binding.outcomes[1].token_id.clone(),
+            description: "explicit test rule".into(),
+            resolution_source: "https://data.chain.link/streams/btc-usd-twap-60s-streams".into(),
+            ..Default::default()
         }).unwrap();
-        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address=listener.local_addr().unwrap();
-        let server=tokio::spawn(async move {axum::serve(listener,router).await.unwrap();});
-        let root=format!("http://{address}/v1/prediction-markets/polymarket/research/btc-5m/official-ws");
-        let http=reqwest::Client::new();
-        let response=tokio::time::timeout(Duration::from_secs(2),async {
-            loop {
-                let response=http.get(format!("{root}/market-streams")).send().await.unwrap();
-                if response.status()==StatusCode::OK {break response}
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        }).await.unwrap();
-        assert_eq!(response.status(),StatusCode::OK);
-        let discovery=wire::MarketStreams::decode(response.bytes().await.unwrap()).unwrap();
-        assert_eq!(discovery.schema_version,live::SCHEMA_VERSION);
-        assert_eq!(discovery.delivery_budget.unwrap().maximum_frame_bytes,8388608);
-        let binding=&discovery.markets[0];let key=binding.key.as_ref().unwrap();
-        let response=http.get(format!("{root}/market-full-sync?market_id={}",key.market_id)).send().await.unwrap();
-        assert_eq!(response.headers()["cache-control"],"no-store");
-        let snapshot=wire::MarketFrame::decode(response.bytes().await.unwrap()).unwrap();
-        assert_eq!(snapshot.stream_id,binding.stream_id);
-        assert!(matches!(snapshot.body,Some(wire::market_frame::Body::Snapshot(_))));
-        let mut request=format!("ws://{address}/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-stream?market_id={}&stream_id={}",key.market_id,binding.stream_id).into_client_request().unwrap();
-        request.headers_mut().insert("sec-websocket-protocol",live::SUBPROTOCOL.parse().unwrap());
-        let (mut ws,response)=tokio_tungstenite::connect_async(request).await.unwrap();
-        assert_eq!(response.headers()["sec-websocket-protocol"],live::SUBPROTOCOL);
-        let message=tokio::time::timeout(Duration::from_secs(2),ws.next()).await.unwrap().unwrap().unwrap();
-        let ClientMessage::Binary(bytes)=message else {panic!("first ordinary snapshot");};
-        let first=wire::MarketFrame::decode(bytes).unwrap();
-        assert_eq!(first.stream_id,binding.stream_id);
-        assert!(matches!(first.body,Some(wire::market_frame::Body::Snapshot(_))));
-        assert_eq!(control.live_identity(&control.profile().unwrap().markets[0]).unwrap().1,binding.stream_id);
-        let _=ws.close(None).await;server.abort();publication.finish().await.unwrap();
+    }
+    #[tokio::test]
+    async fn native_v7_routes_use_registered_rules_and_binary_ordinary_snapshot() {
+        use prost::Message as _;use futures_util::StreamExt;
+        use marketcow_contracts::typed_v3::{self as native,market};
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest,Message as ClientMessage};
+        let publication=crate::source_publication::Publication::start(0,None,BTreeMap::new(),8,131072,65536,|_|Ok(())).unwrap();
+        let p=profile();let b=p.markets[0].clone();
+        let (router,control)=Api::router(publication.reader(),p,"test-epoch".into(),Limits{live_backlog_groups:8,live_backlog_age:Duration::from_millis(100),snapshot_bytes:65536,frame_bytes:4096,replay_bytes:65536,clients:3,send_timeout:Duration::from_secs(1),snapshot_lease_capacity:1}).unwrap();
+        let rules=control.register_native_rules(market::RulesRecord{market_id:b.market_id.clone(),condition_id:b.condition_id.clone(),window_id:b.window_id.clone(),start_at:b.start_at.clone(),end_at:b.end_at.clone(),up_token_id:b.outcomes[0].token_id.clone(),down_token_id:b.outcomes[1].token_id.clone(),description:"explicit test rule".into(),resolution_source:"https://data.chain.link/streams/btc-usd-twap-60s-streams".into(),..Default::default()}).unwrap();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+        let server=tokio::spawn(async move{axum::serve(listener,router).await.unwrap()});
+        for path in [
+            "/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-streams",
+            "/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-full-sync?market_id=600001",
+            "/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-stream?market_id=600001&stream_id=retired",
+        ] {
+            assert_eq!(reqwest::get(format!("http://{address}{path}")).await.unwrap().status(),StatusCode::NOT_FOUND);
+        }
+        let response=reqwest::get(format!("http://{address}/v7/polymarket/btc-5m/market-streams")).await.unwrap();
+        assert_eq!(response.headers()["content-type"],native::CONTENT_TYPE);
+        let discovery=market::MarketStreams::decode(response.bytes().await.unwrap()).unwrap();
+        assert_eq!(discovery.schema_version,native::MARKET_STREAMS_SCHEMA);let binding=&discovery.markets[0];
+        assert_eq!(binding.key.as_ref().unwrap().rules,control.native_key(&b).unwrap().rules);
+        let mut request=format!("ws://{address}/v7/polymarket/btc-5m/market-stream?market_id={}&stream_id={}",b.market_id,binding.stream_id).into_client_request().unwrap();
+        request.headers_mut().insert("sec-websocket-protocol",native::MARKET_SUBPROTOCOL.parse().unwrap());
+        let (mut socket,_)=tokio_tungstenite::connect_async(request).await.unwrap();
+        let packet=tokio::time::timeout(Duration::from_secs(2),socket.next()).await.unwrap().unwrap().unwrap();
+        let ClientMessage::Binary(bytes)=packet else{panic!("expected ordinary binary snapshot")};
+        let frame=market::MarketFrame::decode(bytes).unwrap();assert_eq!(frame.stream_id,binding.stream_id);
+        let Some(market::market_frame::Body::Snapshot(snapshot))=frame.body else{panic!("expected snapshot")};assert_eq!(snapshot.books.len(),2);
+        server.abort();publication.finish().await.unwrap();
     }
     #[test]
     fn live_checkpoint_serializer_has_atomic_segments_and_semantic_hash() {
@@ -2619,10 +2596,10 @@ mod tests {
     use prost::Message as _;
     use tower::ServiceExt;
     #[tokio::test]
-    async fn ordinary_latest_snapshot_keeps_same_socket_then_delivers_next_state() {
+    async fn native_latest_snapshot_keeps_same_socket_then_delivers_next_state() {
         use futures_util::{SinkExt,StreamExt};
+        use marketcow_contracts::typed_v3::{self as native,market as wire};
         use tokio_tungstenite::tungstenite::{client::IntoClientRequest,Message as ClientMessage};
-        use marketcow_contracts::btc5m_market_local_v6::{self as live,wire};
         let mut p = profile();
         let start=Utc::now().timestamp().div_euclid(300)*300;
         for b in &mut p.markets {
@@ -2639,7 +2616,7 @@ mod tests {
                 &binding.condition_id,&binding.outcomes[0].token_id,&binding.outcomes[1].token_id)]});
         let tokens = binding.outcomes.iter().map(|outcome|
             (outcome.token_id.clone(),binding.market_id.clone())).collect();
-        let mut publication = Publication::start(0,Some(seed),tokens,64,
+        let publication = Publication::start(0,Some(seed),tokens,64,
             8*1024*1024,1024*1024,|_|Ok(())).unwrap();
         let publish_pair = |publication:&Publication, group:u64| {
             let received_at = Utc::now();
@@ -2655,28 +2632,19 @@ mod tests {
             publication.publish_native_events(events,None).unwrap();
         };
         for group in 1..=7 { publish_pair(&publication,group); }
-        let (router,_) = Api::router(publication.reader(),p,"loopback-profile".into(),Limits {
+        let (router,control) = Api::router(publication.reader(),p,"loopback-profile".into(),Limits {
             snapshot_bytes:65536,frame_bytes:4096,replay_bytes:65536,clients:2,
             send_timeout:Duration::from_secs(1),snapshot_lease_capacity:1,
             live_backlog_groups:2,live_backlog_age:Duration::from_secs(10)}).unwrap();
-        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address=listener.local_addr().unwrap();
-        let server=tokio::spawn(async move {axum::serve(listener,router).await.unwrap()});
-        let http=reqwest::Client::new();
-        let discovery=tokio::time::timeout(Duration::from_secs(3),async {
-            loop {
-                let response=http.get(format!("http://{address}/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-streams")).send().await.unwrap();
-                if response.status()==StatusCode::OK {
-                    break wire::MarketStreams::decode(response.bytes().await.unwrap()).unwrap();
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        }).await.unwrap();
-        let discovered=discovery.markets.iter().find(|m|m.key.as_ref().unwrap().market_id==binding.market_id).unwrap();
-        let mut request=format!("ws://{address}/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-stream?market_id={}&stream_id={}",
-            binding.market_id,discovered.stream_id).into_client_request().unwrap();
-        request.headers_mut().insert("sec-websocket-protocol",live::SUBPROTOCOL.parse().unwrap());
-        let (mut client,_)=tokio_tungstenite::connect_async(request).await.unwrap();
+        register_test_rules(&control,&binding);
+        let (_,stream_id)=control.native_identity(&binding).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {axum::serve(listener,router).await.unwrap()});
+        let mut request = format!("ws://{address}/v7/polymarket/btc-5m/market-stream?market_id={}&stream_id={}",
+            binding.market_id,stream_id).into_client_request().unwrap();
+        request.headers_mut().insert("sec-websocket-protocol",native::MARKET_SUBPROTOCOL.parse().unwrap());
+        let (mut client,_) = tokio_tungstenite::connect_async(request).await.unwrap();
         let initial=tokio::time::timeout(Duration::from_secs(3),async {
             loop {
                 if let ClientMessage::Binary(bytes)=client.next().await.unwrap().unwrap() {
@@ -2684,6 +2652,7 @@ mod tests {
                 }
             }
         }).await.unwrap();
+        assert_eq!(initial.stream_id,stream_id);
         let Some(wire::market_frame::Body::Snapshot(snapshot))=initial.body else {panic!("ordinary initial snapshot");};
         assert_eq!(snapshot.source_status,"available");
         assert!(snapshot.books.iter().all(|book|book.bids[0].size=="7"));
@@ -2697,7 +2666,7 @@ mod tests {
                     ClientMessage::Pong(bytes)=>{assert_eq!(bytes.as_ref(),[7,8]);pong=true;}
                     ClientMessage::Binary(bytes)=>{
                         let frame=wire::MarketFrame::decode(bytes).unwrap();
-                        assert_eq!(frame.stream_id,discovered.stream_id);
+                        assert_eq!(frame.stream_id,stream_id);
                         if frame.state_sequence<=initial.state_sequence {continue}
                         updated=match frame.body.unwrap() {
                             wire::market_frame::Body::Snapshot(snapshot)=>
@@ -3698,41 +3667,36 @@ mod tests {
         let snapshot_response = router.clone().oneshot(axum::http::Request::builder()
             .uri(snapshot_path).body(axum::body::Body::empty()).unwrap()).await.unwrap();
         assert_eq!(snapshot_response.status(), StatusCode::NOT_FOUND);
-        use marketcow_contracts::btc5m_market_local_v6::{self as live,wire};
-        let official_streams=tokio::time::timeout(Duration::from_secs(2),async {
-            loop {
-                let response=router.clone().oneshot(axum::http::Request::builder()
-                    .uri("/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-streams")
-                    .body(axum::body::Body::empty()).unwrap()).await.unwrap();
-                if response.status()==StatusCode::OK {
-                    break wire::MarketStreams::decode(axum::body::to_bytes(
-                        response.into_body(),65536).await.unwrap()).unwrap();
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        }).await.unwrap();
-        assert_eq!(official_streams.schema_version,live::SCHEMA_VERSION);
-        let ordinary_binding=official_streams.markets.iter()
-            .find(|m|m.key.as_ref().unwrap().market_id==binding.market_id).unwrap();
-        let official_snapshot_path=format!(
-            "/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-full-sync?market_id={}",
-            binding.market_id);
-        let official_snapshot=router.clone().oneshot(axum::http::Request::builder()
-            .uri(official_snapshot_path).body(axum::body::Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(official_snapshot.status(),StatusCode::OK);
-        let official_snapshot=wire::MarketFrame::decode(axum::body::to_bytes(
-            official_snapshot.into_body(),65536).await.unwrap()).unwrap();
-        let Some(wire::market_frame::Body::Snapshot(books))=official_snapshot.body else {panic!("ordinary snapshot");};
-        assert_eq!(books.books.len(),2);
-        let relay=crate::source_official_ws_relay::router(control,reader.clone()).unwrap();
-        let wrong_rule=format!(
-            "/v1/prediction-markets/polymarket/research/btc-5m/official-ws/official-book?market_id={}&condition_id={}&token_id={}&rule_sha256={}&window_id={}&start_at={}&end_at={}&up_token_id={}&down_token_id={}&stream_id={}",
-            binding.market_id,binding.condition_id,binding.outcomes[0].token_id,"f".repeat(64),
-            binding.window_id,binding.start_at,binding.end_at,binding.outcomes[0].token_id,
-            binding.outcomes[1].token_id,ordinary_binding.stream_id);
-        let rejected=relay.oneshot(axum::http::Request::builder().uri(wrong_rule)
+        use marketcow_contracts::typed_v3::{self as native, facts, market as native_market};
+        register_test_rules(&control,&binding);
+        let official_streams = router.clone().oneshot(axum::http::Request::builder()
+            .uri("/v7/polymarket/btc-5m/market-streams")
             .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(official_streams.status(),StatusCode::OK);
+        let discovery = native_market::MarketStreams::decode(axum::body::to_bytes(
+            official_streams.into_body(),65536).await.unwrap()).unwrap();
+        assert_eq!(discovery.schema_version,native::MARKET_STREAMS_SCHEMA);
+        let native_binding=&discovery.markets[0];
+        assert_eq!(native_binding.key.as_ref().unwrap().market_id,binding.market_id);
+        assert_eq!(native_binding.key.as_ref().unwrap().rules,control.native_key(&binding).unwrap().rules);
+        // The retired JSON/full-sync route stays absent after the protocol move.
+        let retired = router.clone().oneshot(axum::http::Request::builder()
+            .uri(format!("/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-full-sync?market_id={}",binding.market_id))
+            .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(retired.status(),StatusCode::NOT_FOUND);
+        let mut wrong_key=native_binding.key.clone().unwrap();
+        wrong_key.rules.as_mut().unwrap().revision+=1;
+        let request=facts::OfficialBookRequest{request_id:"wrong-rules".into(),key:Some(wrong_key),
+            stream_id:native_binding.stream_id.clone(),token_id:binding.outcomes[0].token_id.clone(),
+            representation:"typed".into()};
+        let relay=crate::source_official_ws_relay::router(control,reader.clone()).unwrap();
+        let rejected=relay.oneshot(axum::http::Request::builder()
+            .method("POST").uri("/v1/facts/polymarket/official-book")
+            .header("content-type",native::CONTENT_TYPE)
+            .body(axum::body::Body::from(request.encode_to_vec())).unwrap()).await.unwrap();
         assert_eq!(rejected.status(),StatusCode::CONFLICT);
+        let failure=facts::Failure::decode(axum::body::to_bytes(rejected.into_body(),65536).await.unwrap()).unwrap();
+        assert_eq!(failure.error.unwrap().code,"identity_not_active");
         let path = format!("/v1/prediction-markets/polymarket/research/btc-5m/market-replay?market_id={}&stream_epoch={}&after_market_cursor=0&maximum_groups=1",
             binding.market_id, watermark.stream_epoch);
         let response = router.clone().oneshot(axum::http::Request::builder().uri(path)

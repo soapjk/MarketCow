@@ -5,7 +5,7 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get,post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
@@ -87,6 +87,48 @@ struct Service {
     client: reqwest::Client,
     slots: Arc<Semaphore>,
 }
+fn shared_service()->Result<Service> {
+    static SHARED:std::sync::OnceLock<Service>=std::sync::OnceLock::new();
+    if let Some(service)=SHARED.get(){return Ok(service.clone());}
+    let service=Service {client:reqwest::Client::builder().timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).build()?,slots:Arc::new(Semaphore::new(1))};
+    let _=SHARED.set(service);
+    Ok(SHARED.get().context("facts_client_unavailable")?.clone())
+}
+pub fn native_router(control:crate::source_btc5m_api::Control)->Result<Router> {
+    Ok(Router::new().route("/v1/facts/polymarket/execution",post(read_native_execution))
+        .with_state((shared_service()?,control)).layer(axum::extract::DefaultBodyLimit::max(64*1024)))
+}
+async fn read_native_execution(State((service,control)):State<(Service,crate::source_btc5m_api::Control)>,headers:axum::http::HeaderMap,
+    body:std::result::Result<axum::body::Bytes,axum::extract::rejection::BytesRejection>)->Response {
+    use marketcow_contracts::typed_v3::facts;use prost::Message;
+    use crate::source_facts_rest::{Failed,response};
+    let request=match crate::source_facts_rest::decode::<facts::MarketRequest>(&headers,body){Ok(v)=>v,Err(e)=>return e.into_response()};
+    if crate::source_facts_typed::validate_request(&request).is_err(){return Failed::local(&request.request_id,"invalid_request",400).into_response();}
+    let cloned=control.clone();let key=request.key.as_ref().unwrap().clone();
+    if !matches!(tokio::task::spawn_blocking(move||cloned.validate_native_key(&key)).await,Ok(Ok(_))) {
+        return Failed::local(&request.request_id,"rule_identity_mismatch",409).into_response();
+    }
+    let Ok(_slot)=service.slots.try_acquire()else{return Failed::local(&request.request_id,"facts_capacity",503).into_response()};
+    let adapter=crate::source_facts_rest::Service::from_existing(service.client.clone(),service.slots.clone());
+    let url=format!("https://clob.polymarket.com/clob-markets/{}",request.key.as_ref().unwrap().condition_id);
+    let (_,raw)=match adapter.exchange_with(&request.request_id,&url,CAP,Duration::from_secs(15)).await {Ok(v)=>v,Err(e)=>return e.into_response()};
+    let copied=request.clone();
+    let result=tokio::task::spawn_blocking(move||->Result<facts::ExecutionFactsResponse>{
+        let key=copied.key.as_ref().context("missing_market_key")?;
+        let identity=crate::source_facts_rest::provisional_identity();
+        let meta=facts::FactMeta{identity:Some(identity),key:Some(key.clone()),observed_at_ns:chrono::Utc::now().timestamp_nanos_opt().context("clock_unavailable")?,evidence:Vec::new()};
+        let mut value=crate::source_facts_typed::execution(&copied,meta,&raw)?;
+        value.request_id.clear();value.meta=None;
+        let identity=control.native_fact_record("execution",&key.encode_to_vec(),&value.encode_to_vec())?;
+        value.request_id=copied.request_id;value.meta=Some(facts::FactMeta{identity:Some(identity),key:Some(key.clone()),observed_at_ns:chrono::Utc::now().timestamp_nanos_opt().context("clock_unavailable")?,evidence:Vec::new()});
+        Ok(value)
+    }).await;
+    match result {Ok(Ok(v))=>response(200,&v,"marketcow.facts.v1.ExecutionFactsResponse",None),
+        Ok(Err(e)) if e.to_string()=="unsupported_fee_model"=>Failed::local(&request.request_id,"unsupported_fee_model",501).into_response(),
+        Ok(Err(e)) if e.to_string()=="upstream_identity_mismatch"=>Failed::local(&request.request_id,"upstream_identity_mismatch",409).into_response(),
+        _=>Failed::local(&request.request_id,"invalid_upstream_payload",502).into_response()}
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
@@ -159,14 +201,7 @@ pub fn router() -> Result<Router> {
             "/v1/prediction-markets/polymarket/research/market-execution-facts",
             get(read_execution),
         )
-        .with_state(Service {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(15))
-                .redirect(reqwest::redirect::Policy::none())
-                .retry(reqwest::retry::never())
-                .build()?,
-            slots: Arc::new(Semaphore::new(1)),
-        }))
+        .with_state(shared_service()?))
 }
 fn decimal(v: &Value, name: &str, allow_zero: bool) -> Result<String> {
     let text = if let Some(n) = v.as_number() {

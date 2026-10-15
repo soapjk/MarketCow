@@ -1,0 +1,41 @@
+syntax = "proto3";
+package marketcow.facts.v1;
+import "marketcow/common/v1/types.proto";
+import "marketcow/facts/v1/common.proto";
+
+message ReferenceReading {
+  marketcow.common.v1.RecordIdentity identity = 1;
+  string purpose = 2; // official_price_to_beat | binance_preopen_proxy | current_proxy
+  string instrument_id = 3;
+  string quote_currency = 4; // USD and USDT are NOT interchangeable.
+  string price_method = 5;
+  string price = 6;
+  int64 boundary_time_ms = 7;
+  optional int64 interval_start_ms = 8;
+  optional int64 interval_end_ms = 9;
+  optional uint64 covered_ms = 10;
+  string selection_rule = 11;
+  string verification = 12;
+  optional int64 supplier_report_time_ms = 13;
+  optional string supplier_response_timestamp = 14; // Exact upstream scalar, no inferred unit.
+  repeated string source_generations = 15;
+  repeated marketcow.common.v1.EvidenceReference evidence = 16;
+  optional string baseline_id = 17; // Persistent business ID; not content-derived.
+  optional string supplier_response_timestamp_unit = 18; // Absent when not established.
+}
+message ReadingState {
+  bool available = 1;
+  optional string reason = 2;
+  optional ReferenceReading reading = 3;
+}
+message ReferenceResponse {
+  string schema_version = 1; // marketcow.facts.reference.v1
+  string request_id = 2;
+  FactMeta meta = 3;
+  ReadingState official_opening = 4;
+  ReadingState binance_opening = 5;
+  ReadingState binance_current = 6;
+  bool binance_is_settlement_source = 7; // Always false.
+  optional string mapped_official_scale_price = 8; // Proxy only, never official PTB.
+  optional string mapping_reason = 9;
+}

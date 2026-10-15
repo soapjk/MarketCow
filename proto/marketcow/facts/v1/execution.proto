@@ -1,0 +1,58 @@
+syntax = "proto3";
+package marketcow.facts.v1;
+import "marketcow/common/v1/types.proto";
+import "marketcow/facts/v1/common.proto";
+
+message InstrumentFacts {
+  optional string price_increment = 1;
+  optional string minimum_order_size = 2;
+  optional string size_increment = 3;
+  string price_unit = 4; // probability
+  string size_unit = 5; // shares
+  repeated string missing_fields = 6;
+}
+message FeeFacts {
+  string model = 1;
+  optional string currency = 2;
+  optional string maker_rate = 3;
+  optional string taker_rate = 4;
+  optional uint32 exponent = 5;
+  optional bool taker_only = 6;
+  optional string quantum = 7;
+  optional string rounding_mode = 8;
+  optional int64 effective_at_ns = 9;
+  optional string maker_base_fee_bps = 10;
+  optional string taker_base_fee_bps = 11;
+  repeated string missing_fields = 12;
+  string applicability = 13;
+}
+message OrderExecutionFacts {
+  optional bool taker_order_delay_enabled = 1;
+  optional uint64 marketable_hold_ms = 2;
+  repeated string missing_fields = 3;
+  repeated marketcow.common.v1.EvidenceReference documentation = 4;
+}
+message LocalExecutionPolicy {
+  marketcow.common.v1.RecordIdentity identity = 1;
+  string origin = 2; // operator_configuration; NEVER upstream fact.
+  string purpose = 3;
+  optional string fee_currency = 4;
+  optional string fee_quantum = 5;
+  optional string rounding_mode = 6;
+  optional string size_increment = 7;
+  optional string fee_upper_bound_method = 8;
+}
+message ExecutionFactsResponse {
+  string schema_version = 1; // marketcow.facts.execution.v1
+  string request_id = 2;
+  FactMeta meta = 3;
+  string source = 4;
+  string source_url = 5;
+  InstrumentFacts instrument = 6;
+  FeeFacts fees = 7;
+  OrderExecutionFacts order_execution = 8;
+  repeated LocalExecutionPolicy explicit_policies = 9;
+  repeated string unavailable_capabilities = 10;
+}
+// Missing upstream fields remain absent even if an explicit policy supplies a
+// conservative execution choice. No aggregate source flag authorizes trading.
