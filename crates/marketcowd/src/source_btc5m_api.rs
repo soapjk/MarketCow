@@ -2363,6 +2363,17 @@ fn confirmation_wait(
 
 #[cfg(test)]
 mod tests {
+    fn register_test_rules(control: &super::Control, binding: &super::MarketBinding) {
+        control.register_native_rules(marketcow_contracts::typed_v3::market::RulesRecord {
+            market_id: binding.market_id.clone(), condition_id: binding.condition_id.clone(),
+            window_id: binding.window_id.clone(), start_at: binding.start_at.clone(),
+            end_at: binding.end_at.clone(), up_token_id: binding.outcomes[0].token_id.clone(),
+            down_token_id: binding.outcomes[1].token_id.clone(),
+            description: "explicit test rule".into(),
+            resolution_source: "https://data.chain.link/streams/btc-usd-twap-60s-streams".into(),
+            ..Default::default()
+        }).unwrap();
+    }
     #[tokio::test]
     async fn native_v7_routes_use_registered_rules_and_binary_ordinary_snapshot() {
         use prost::Message as _;use futures_util::StreamExt;
@@ -2585,17 +2596,27 @@ mod tests {
     use prost::Message as _;
     use tower::ServiceExt;
     #[tokio::test]
-    async fn live_backlog_checkpoint_keeps_same_socket_then_delivers_next_group() {
+    async fn native_latest_snapshot_keeps_same_socket_then_delivers_next_state() {
         use futures_util::{SinkExt,StreamExt};
+        use marketcow_contracts::typed_v3::{self as native,market as wire};
         use tokio_tungstenite::tungstenite::{client::IntoClientRequest,Message as ClientMessage};
-        let p = profile();
+        let mut p = profile();
+        let start=Utc::now().timestamp().div_euclid(300)*300;
+        for b in &mut p.markets {
+            let offset=match b.role {WindowRole::Current=>0,WindowRole::Next=>300,WindowRole::Retiring=>-300};
+            let at=start+offset;
+            b.start_at=chrono::DateTime::from_timestamp(at,0).unwrap().to_rfc3339();
+            b.end_at=chrono::DateTime::from_timestamp(at+300,0).unwrap().to_rfc3339();
+            b.window_id=format!("btc-updown-5m-{at}");
+        }
+        p.profile_id=p.expected_id();
         let binding = p.markets[0].clone();
         let seed = json!({"latest_cursor":0,"catalog_revision":"a".repeat(64),
             "gaps":[],"books":[],"markets":[market(&binding.market_id,
                 &binding.condition_id,&binding.outcomes[0].token_id,&binding.outcomes[1].token_id)]});
         let tokens = binding.outcomes.iter().map(|outcome|
             (outcome.token_id.clone(),binding.market_id.clone())).collect();
-        let mut publication = Publication::start(0,Some(seed),tokens,64,
+        let publication = Publication::start(0,Some(seed),tokens,64,
             8*1024*1024,1024*1024,|_|Ok(())).unwrap();
         let publish_pair = |publication:&Publication, group:u64| {
             let received_at = Utc::now();
@@ -2611,66 +2632,50 @@ mod tests {
             publication.publish_native_events(events,None).unwrap();
         };
         for group in 1..=7 { publish_pair(&publication,group); }
-        let watermark = publication.reader().market_stream_watermark(&binding.market_id).unwrap().unwrap();
-        let (router,_) = Api::router(publication.reader(),p,"loopback-profile".into(),Limits {
+        let (router,control) = Api::router(publication.reader(),p,"loopback-profile".into(),Limits {
             snapshot_bytes:65536,frame_bytes:4096,replay_bytes:65536,clients:2,
             send_timeout:Duration::from_secs(1),snapshot_lease_capacity:1,
             live_backlog_groups:2,live_backlog_age:Duration::from_secs(10)}).unwrap();
+        register_test_rules(&control,&binding);
+        let (_,stream_id)=control.native_identity(&binding).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {axum::serve(listener,router).await.unwrap()});
-        let mut request = format!("ws://{address}/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-stream?market_id={}&stream_epoch={}&profile_epoch=loopback-profile&after_market_cursor=1&after_confirmation_sequence=0",
-            binding.market_id,watermark.stream_epoch).into_client_request().unwrap();
-        request.headers_mut().insert("sec-websocket-protocol",MARKET_PROTO_SUBPROTOCOL.parse().unwrap());
+        let mut request = format!("ws://{address}/v7/polymarket/btc-5m/market-stream?market_id={}&stream_id={}",
+            binding.market_id,stream_id).into_client_request().unwrap();
+        request.headers_mut().insert("sec-websocket-protocol",native::MARKET_SUBPROTOCOL.parse().unwrap());
         let (mut client,_) = tokio_tungstenite::connect_async(request).await.unwrap();
-        let mut checkpoint_parts = Vec::new();
-        let mut committed = false;
-        tokio::time::timeout(Duration::from_secs(3),async {
+        let initial=tokio::time::timeout(Duration::from_secs(3),async {
             loop {
-                let ClientMessage::Binary(bytes) = client.next().await.unwrap().unwrap() else {continue};
-                let frame = proto::MarketStreamFrame::decode(bytes).unwrap();
-                match frame.body.unwrap() {
-                    proto::market_stream_frame::Body::CheckpointBegin(begin) => {
-                        assert_eq!(begin.replaces_after_market_cursor,1);
-                        assert_eq!(begin.market_cursor,7);
-                    },
-                    proto::market_stream_frame::Body::CheckpointChunk(chunk) =>
-                        checkpoint_parts.extend_from_slice(&chunk.encoded_checkpoint_part),
-                    proto::market_stream_frame::Body::CheckpointCommit(commit) => {
-                        assert_eq!(commit.market_cursor,7);
-                        let checkpoint = proto::LiveCheckpoint::decode(checkpoint_parts.as_slice()).unwrap();
-                        assert_eq!(checkpoint.snapshot.unwrap().books.len(),2);
-                        committed = true;
-                    },
-                    proto::market_stream_frame::Body::Ready(ready) => {
-                        assert!(committed);
-                        assert_eq!(ready.market_cursor,Some(7));
-                        break;
-                    },
-                    other => panic!("unexpected pre-ready frame {other:?}"),
+                if let ClientMessage::Binary(bytes)=client.next().await.unwrap().unwrap() {
+                    break wire::MarketFrame::decode(bytes).unwrap();
                 }
             }
         }).await.unwrap();
+        assert_eq!(initial.stream_id,stream_id);
+        let Some(wire::market_frame::Body::Snapshot(snapshot))=initial.body else {panic!("ordinary initial snapshot");};
+        assert_eq!(snapshot.source_status,"available");
+        assert!(snapshot.books.iter().all(|book|book.bids[0].size=="7"));
         publish_pair(&publication,8);
         client.send(ClientMessage::Ping(vec![7,8].into())).await.unwrap();
-        let mut pong = false;
-        let mut group_committed = false;
+        let mut pong=false;
+        let mut updated=false;
         tokio::time::timeout(Duration::from_secs(3),async {
-            while !pong || !group_committed {
+            while !pong || !updated {
                 match client.next().await.unwrap().unwrap() {
-                    ClientMessage::Pong(bytes) => {assert_eq!(bytes.as_ref(),[7,8]);pong=true;},
-                    ClientMessage::Binary(bytes) => {
-                        let frame = proto::MarketStreamFrame::decode(bytes).unwrap();
-                        match frame.body.unwrap() {
-                            proto::market_stream_frame::Body::GroupCommit(commit) => {
-                                assert_eq!(commit.market_cursor,8); group_committed=true;
-                            },
-                            proto::market_stream_frame::Body::Unavailable(_) |
-                            proto::market_stream_frame::Body::ProfileChanged(_) => panic!("unexpected invalidation"),
-                            _ => {},
-                        }
-                    },
-                    other => panic!("unexpected socket frame {other:?}"),
+                    ClientMessage::Pong(bytes)=>{assert_eq!(bytes.as_ref(),[7,8]);pong=true;}
+                    ClientMessage::Binary(bytes)=>{
+                        let frame=wire::MarketFrame::decode(bytes).unwrap();
+                        assert_eq!(frame.stream_id,stream_id);
+                        if frame.state_sequence<=initial.state_sequence {continue}
+                        updated=match frame.body.unwrap() {
+                            wire::market_frame::Body::Snapshot(snapshot)=>
+                                snapshot.books.iter().all(|book|book.bids.first().is_some_and(|b|b.size=="8")),
+                            wire::market_frame::Body::PriceChange(delta)=>
+                                delta.changes.iter().any(|change|change.side=="BUY" && change.size=="8"),
+                        };
+                    }
+                    other=>panic!("unexpected ordinary socket frame {other:?}"),
                 }
             }
         }).await.unwrap();
@@ -3662,33 +3667,36 @@ mod tests {
         let snapshot_response = router.clone().oneshot(axum::http::Request::builder()
             .uri(snapshot_path).body(axum::body::Body::empty()).unwrap()).await.unwrap();
         assert_eq!(snapshot_response.status(), StatusCode::NOT_FOUND);
+        use marketcow_contracts::typed_v3::{self as native, facts, market as native_market};
+        register_test_rules(&control,&binding);
         let official_streams = router.clone().oneshot(axum::http::Request::builder()
-            .uri("/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-streams")
+            .uri("/v7/polymarket/btc-5m/market-streams")
             .body(axum::body::Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(official_streams.status(), StatusCode::OK);
-        let official_streams = proto::MarketStreams::decode(axum::body::to_bytes(
-            official_streams.into_body(), 65536).await.unwrap()).unwrap();
-        assert_eq!(official_streams.profile_epoch, "profile-epoch");
-        assert_eq!(official_streams.markets[0].identity.as_ref().unwrap().market_id,
-            binding.market_id);
-        let official_snapshot_path = format!(
-            "/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-full-sync?market_id={}",
-            binding.market_id);
-        let official_snapshot = router.clone().oneshot(axum::http::Request::builder()
-            .uri(official_snapshot_path).body(axum::body::Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(official_snapshot.status(), StatusCode::OK);
-        let official_snapshot = proto::MarketFullSync::decode(axum::body::to_bytes(
-            official_snapshot.into_body(), 65536).await.unwrap()).unwrap();
-        assert_eq!(official_snapshot.books.len(), 2);
-        let relay = crate::source_official_ws_relay::router(control, reader.clone()).unwrap();
-        let wrong_rule = format!(
-            "/v1/prediction-markets/polymarket/research/btc-5m/official-ws/official-book?market_id={}&condition_id={}&token_id={}&rule_sha256={}&profile_id={}&profile_revision={}&profile_epoch=profile-epoch&stream_epoch={}",
-            binding.market_id, binding.condition_id, binding.outcomes[0].token_id,
-            "f".repeat(64), profile.profile_id, profile.profile_revision,
-            watermark.stream_epoch);
-        let rejected = relay.oneshot(axum::http::Request::builder()
-            .uri(wrong_rule).body(axum::body::Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        assert_eq!(official_streams.status(),StatusCode::OK);
+        let discovery = native_market::MarketStreams::decode(axum::body::to_bytes(
+            official_streams.into_body(),65536).await.unwrap()).unwrap();
+        assert_eq!(discovery.schema_version,native::MARKET_STREAMS_SCHEMA);
+        let native_binding=&discovery.markets[0];
+        assert_eq!(native_binding.key.as_ref().unwrap().market_id,binding.market_id);
+        assert_eq!(native_binding.key.as_ref().unwrap().rules,control.native_key(&binding).unwrap().rules);
+        // The retired JSON/full-sync route stays absent after the protocol move.
+        let retired = router.clone().oneshot(axum::http::Request::builder()
+            .uri(format!("/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-full-sync?market_id={}",binding.market_id))
+            .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(retired.status(),StatusCode::NOT_FOUND);
+        let mut wrong_key=native_binding.key.clone().unwrap();
+        wrong_key.rules.as_mut().unwrap().revision+=1;
+        let request=facts::OfficialBookRequest{request_id:"wrong-rules".into(),key:Some(wrong_key),
+            stream_id:native_binding.stream_id.clone(),token_id:binding.outcomes[0].token_id.clone(),
+            representation:"typed".into()};
+        let relay=crate::source_official_ws_relay::router(control,reader.clone()).unwrap();
+        let rejected=relay.oneshot(axum::http::Request::builder()
+            .method("POST").uri("/v1/facts/polymarket/official-book")
+            .header("content-type",native::CONTENT_TYPE)
+            .body(axum::body::Body::from(request.encode_to_vec())).unwrap()).await.unwrap();
+        assert_eq!(rejected.status(),StatusCode::CONFLICT);
+        let failure=facts::Failure::decode(axum::body::to_bytes(rejected.into_body(),65536).await.unwrap()).unwrap();
+        assert_eq!(failure.error.unwrap().code,"identity_not_active");
         let path = format!("/v1/prediction-markets/polymarket/research/btc-5m/market-replay?market_id={}&stream_epoch={}&after_market_cursor=0&maximum_groups=1",
             binding.market_id, watermark.stream_epoch);
         let response = router.clone().oneshot(axum::http::Request::builder().uri(path)
