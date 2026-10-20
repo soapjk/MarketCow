@@ -117,7 +117,10 @@ pub fn insert_trades(
     for row in rows {
         super::btc_typed::validate_trade(row)?;
     }
-    let tx = db.transaction()?;
+    // Acquire the writer reservation before checking existing identities.
+    // A deferred read -> write upgrade can fail immediately with BUSY_SNAPSHOT
+    // while the explicit migration and old writer share this WAL database.
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut evidence_id = None;
     let mut inserted = 0;
     let high: Option<i64> =
@@ -207,7 +210,7 @@ pub fn insert_observations(
             && rows.len() <= 4096,
         "observation batch identity/capacity"
     );
-    let tx = db.transaction()?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut evidence_id = None;
     let mut inserted = 0;
     {

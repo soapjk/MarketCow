@@ -5,6 +5,7 @@ Usage: python3 scripts/deploy_u1_marketcow.py
 Only user-owned U1 is contacted. Runtime data and service arguments are retained.
 """
 import argparse
+from contextlib import closing
 import fcntl
 import hashlib
 import json
@@ -13,11 +14,13 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tarfile
 import tempfile
 import time
+import tomllib
 
 ROOT = Path('/mnt/p44pro/marketcow-shadow-v3-runtime/linux')
 UNIT = 'marketcow-polymarket-collector.service'
@@ -58,9 +61,12 @@ def source_files(repo):
     names = {'Cargo.toml', 'Cargo.lock', 'scripts/run_with_bounded_log.py',
              'scripts/deploy_u1_marketcow.py',
              'docs/architecture/migration/domain-ownership.yaml'}
-    for path in (repo / 'crates').rglob('*'):
-        if path.is_file() and (path.suffix in ('.rs', '.json') or path.name == 'Cargo.toml'):
-            names.add(path.relative_to(repo).as_posix())
+    # Only the wire crate belongs in service builds, not the SDK/client runtime.
+    for directory in ('crates', 'sdk/crates/marketcow-wire'):
+        for path in (repo / directory).rglob('*'):
+            if path.is_file() and (path.suffix in ('.rs', '.json', '.proto')
+                                   or path.name == 'Cargo.toml'):
+                names.add(path.relative_to(repo).as_posix())
     for path in (repo / 'proto').rglob('*.proto'):
         if path.is_file():
             names.add(path.relative_to(repo).as_posix())
@@ -74,7 +80,69 @@ def source_files(repo):
         yield name
 
 
+def cargo_seed_entries(repo, present, cargo_root=None):
+    """Only public locked crate archives/index records, never Cargo config/token files."""
+    cargo_root = cargo_root or Path(os.environ.get('CARGO_HOME', str(Path.home() / '.cargo')))
+    entries = {}
+    for package in tomllib.loads((repo / 'Cargo.lock').read_text())['package']:
+        if package.get('source') != 'registry+https://github.com/rust-lang/crates.io-index':
+            continue
+        name, version = package['name'], package['version']
+        if not re.fullmatch(r'[A-Za-z0-9_-]+', name) or not re.fullmatch(r'[A-Za-z0-9_.+-]+', version):
+            raise RuntimeError('unsafe locked crate identity')
+        archive = f'{name}-{version}.crate'
+        if archive in present:
+            continue
+        lower = name.lower()
+        key = ('1/' + lower if len(lower) == 1 else '2/' + lower if len(lower) == 2
+               else '3/' + lower[0] + '/' + lower if len(lower) == 3
+               else lower[:2] + '/' + lower[2:4] + '/' + lower)
+        cached = next((p for p in (cargo_root / 'registry/cache').glob('*/' + archive)
+                       if p.is_file() and not p.is_symlink()), None)
+        index = next((p for p in (cargo_root / 'registry/index').glob('*/.cache/' + key)
+                      if p.is_file() and not p.is_symlink()), None)
+        if cached is not None and index is not None:
+            entries['dependency-seed/cache/' + archive] = cached
+            entries['dependency-seed/index/' + key] = index
+    if sum(p.stat().st_size for p in entries.values()) > 256 * 1024**2:
+        raise RuntimeError('locked dependency seed exceeds 256MiB')
+    return entries
+
+
+def install_cargo_seed(source):
+    seed = source / 'dependency-seed'
+    if not seed.is_dir() or seed.is_symlink():
+        raise RuntimeError('explicit dependency seed absent')
+    cargo = Path(os.environ.get('CARGO_HOME', str(Path.home() / '.cargo')))
+    count = 0
+    for kind, target in (('cache', cargo / 'registry/cache/index.crates.io-1949cf8c6b5b557f'),
+                         ('index', cargo / 'registry/index/index.crates.io-1949cf8c6b5b557f/.cache')):
+        for original in (seed / kind).rglob('*'):
+            if original.is_dir():
+                continue
+            if original.is_symlink():
+                raise RuntimeError('linked dependency seed input')
+            relative = original.relative_to(seed / kind)
+            destination = target / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.is_symlink():
+                raise RuntimeError('linked dependency cache destination')
+            with tempfile.NamedTemporaryFile(prefix='deployment-cache-', dir=destination.parent,
+                                             delete=False) as staged:
+                temporary = Path(staged.name)
+                with original.open('rb') as stream:
+                    shutil.copyfileobj(stream, staged)
+            temporary.chmod(0o644)
+            temporary.replace(destination)
+            count += 1
+    return count
+
+
 def local(args):
+    if args.activate_prepared:
+        run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', args.host,
+             f'python3 {DEPLOY}/source/scripts/deploy_u1_marketcow.py --remote --activate-prepared --disable-btc-polynode'])
+        return
     repo = Path(__file__).resolve().parents[1]
     t9 = Path('/Volumes/T9')
     if (not t9.is_mount() or t9.stat().st_dev == Path('/private/tmp').stat().st_dev
@@ -84,14 +152,25 @@ def local(args):
     scratch.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='sync-', dir=scratch) as directory:
         stage = Path(directory)
+        ssh = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', args.host]
         names = list(source_files(repo))
         manifest = {name: sha(repo / name) for name in names}
+        seed = {}
+        if args.seed_cargo_cache:
+            inventory = "import os,json;from pathlib import Path;p=Path(os.environ.get('CARGO_HOME',str(Path.home()/'.cargo')))/'registry/cache/index.crates.io-1949cf8c6b5b557f';print(json.dumps([f.name for f in p.glob('*.crate')]))"
+            present = json.loads(run([*ssh, 'python3 -c ' + shlex.quote(inventory)],
+                                     capture_output=True, text=True).stdout)
+            seed = cargo_seed_entries(repo, set(present))
+            if not seed:
+                raise RuntimeError('no missing locked public dependencies available in local cache')
+            manifest.update({name: sha(path) for name, path in seed.items()})
         (stage / 'manifest.json').write_text(json.dumps(manifest, sort_keys=True))
         archive = stage / 'source.tar.gz'
         with tarfile.open(archive, 'w:gz', format=tarfile.USTAR_FORMAT) as tar:
             for name in names:
                 tar.add(repo / name, arcname=name, recursive=False)
-        ssh = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', args.host]
+            for name, path in seed.items():
+                tar.add(path, arcname=name, recursive=False)
         run([*ssh, f'mkdir -p {DEPLOY}/incoming && chmod 700 {DEPLOY} {DEPLOY}/incoming'])
         run(['scp', '-q', str(archive), str(stage / 'manifest.json'),
              str(repo / 'scripts/deploy_u1_marketcow.py'), f'{args.host}:{DEPLOY}/incoming/'])
@@ -109,12 +188,84 @@ def local(args):
         uk_ws_option = ' --uk-polymarket-ws-route' if args.uk_polymarket_ws_route else ''
         quick_option = ' --quick' if args.quick else ''
         external_build_option = ' --external-build' if args.external_build else ''
+        migration_option = ' --migrate-typed-btc' if args.migrate_typed_btc else ''
+        dependency_option = ' --fetch-dependencies' if args.fetch_dependencies else ''
+        seed_option = ' --seed-cargo-cache' if args.seed_cargo_cache else ''
+        binance_option = (' --binance-proxy ' + shlex.quote(args.binance_proxy)
+                          if args.binance_proxy else '')
+        sdk_option = (' --sdk-listen ' + shlex.quote(args.sdk_listen)
+                      + ' --sdk-access-policy ' + shlex.quote(args.sdk_access_policy)
+                      if args.sdk_listen else '')
+        prepare_option = ' --prepare-only' if args.prepare_only else ''
         run([*ssh, f'python3 {DEPLOY}/incoming/deploy_u1_marketcow.py '
              f'--remote --archive-sha256 {sha(archive)} --jobs {args.jobs}'
              f'{replay_option}{persistence_option}{chainlink_option}{btc_5m_option}'
              f'{polynode_option}'
              f'{uk_ws_option}'
-             f'{quick_option}{external_build_option}'])
+             f'{quick_option}{external_build_option}{migration_option}{dependency_option}{seed_option}{binance_option}{sdk_option}{prepare_option}'])
+
+
+def typed_migration_root(unit):
+    matches = re.findall(r'--btc-research-root\s+([^\s\\]+)', unit)
+    if len(matches) != 1:
+        raise RuntimeError('typed migration requires exactly one existing BTC research root')
+    root = Path(matches[0])
+    if (not root.is_absolute() or root.is_symlink() or not root.is_dir()
+            or root.resolve() == ROOT.resolve()
+            or not root.resolve().is_relative_to(ROOT.resolve())):
+        raise RuntimeError('typed migration root must be an existing runtime subdirectory')
+    return root
+
+
+def run_typed_migrations(unit, binary, receipt, phase='handoff'):
+    """Explicit old DB -> typed tables; prepare live, then replay the stop tail.
+
+    No archive scan, no account paths and no configuration changes. Import
+    checkpoints make re-running the same bounded migration idempotent.
+    """
+    root = typed_migration_root(unit)
+    if shutil.disk_usage(root).free < 2 * 1024**3:
+        raise RuntimeError('2GiB free required before typed database migration')
+    freeze_ms = time.time_ns() // 1_000_000
+    results = []
+    for source, relative, latest_sql in (
+        ('binance-typed', 'binance-trades/trades.sqlite3',
+         'SELECT trade_time_ms FROM binance_trades ORDER BY trade_id DESC LIMIT 1'),
+        ('chainlink-typed', 'chainlink-twap/observations.sqlite3',
+         "SELECT source_time_ms FROM chainlink_observations WHERE kind='twap60' ORDER BY source_time_ms DESC LIMIT 1"),
+    ):
+        database = root / relative
+        if database.is_symlink() or not database.is_file():
+            raise RuntimeError(f'explicit typed migration source missing: {database}')
+        with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=2)) as db:
+            row = db.execute(latest_sql).fetchone()
+        if row is None:
+            raise RuntimeError(f'explicit typed migration source has no observations: {database}')
+        start = freeze_ms - 40 * 60 * 1000
+        end = max(freeze_ms, int(row[0])) + 1
+        if end - start > 3600000:
+            raise RuntimeError('typed migration supplier time outside bounded interval')
+        with (DEPLOY / 'build.log').open('a') as log:
+            result = run([str(binary), str(root), source, str(database),
+                          f'--start-time-ms={start}', f'--end-time-ms={end}'],
+                         capture_output=False, stdout=subprocess.PIPE, stderr=log,
+                         timeout=1205, text=True)
+        if len(result.stdout) > 65536:
+            raise RuntimeError('typed migration receipt capacity')
+        item = json.loads(result.stdout)
+        if (item.get('schema_version') != 'marketcow.typed-db-import.v1'
+                or item.get('start_time_ms') != start or item.get('end_time_ms') != end
+                or item.get('source_database') != str(database.resolve())
+                or item.get('destination_database') != str(database)):
+            raise RuntimeError('typed migration receipt identity mismatch')
+        # Import completion is deliberately not a statement of complete data.
+        if item.get('coverage_verified') is not False:
+            raise RuntimeError('typed migration cannot certify requested-range coverage')
+        results.append(item)
+        receipt['typed_database_imports'] = results
+        receipt.setdefault('typed_database_migration_phases', {})[phase] = results
+        (DEPLOY / f'typed-migration-{phase}.json').write_text(json.dumps(
+            {'phase': phase, 'freeze_at_ms': freeze_ms, 'imports': results}, sort_keys=True, indent=2))
 
 
 def unpack_verified(archive, manifest, destination):
@@ -384,6 +535,36 @@ def pin_uk_polymarket_ws_route():
     return node
 
 
+def with_binance_proxy(unit, proxy):
+    if proxy != 'http://127.0.0.1:17892':
+        raise RuntimeError('Binance proxy must use the dedicated loopback endpoint')
+    marker = 'Environment="MARKETCOW_BINANCE_PROXY='
+    lines = [line for line in unit.splitlines() if not line.startswith(marker)]
+    if lines.count('[Service]') != 1:
+        raise RuntimeError('collector Service section must be unique')
+    lines.insert(lines.index('[Service]') + 1,
+                 f'Environment="MARKETCOW_BINANCE_PROXY={proxy}"')
+    return '\n'.join(lines) + '\n'
+
+
+def with_sdk_listener(unit, listen, policy):
+    if listen != '127.0.0.1:18793' or policy != str(DEPLOY / 'private/sdk-access.pb'):
+        raise RuntimeError('SDK boundary requires the dedicated loopback and private policy path')
+    marker = '--public-listen '
+    if unit.count(marker) != 1:
+        raise RuntimeError('SDK boundary requires one existing internal listener')
+    missing = []
+    for option, value in (('sdk-listen', listen), ('sdk-access-policy', policy)):
+        matches = re.findall(r'--' + option + r'\s+[^\s\\]+', unit)
+        if len(matches) > 1:
+            raise RuntimeError('duplicate SDK listener/policy option')
+        if matches:
+            unit = unit.replace(matches[0], f'--{option} {value}', 1)
+        else:
+            missing.append(f'--{option} {value}')
+    return unit.replace(marker, ' '.join(missing) + ' ' + marker, 1) if missing else unit
+
+
 def remote(args):
     if not ROOT.is_mount() or ROOT.resolve() != ROOT:
         raise RuntimeError('U1 runtime data volume is not mounted')
@@ -392,6 +573,9 @@ def remote(args):
     DEPLOY.mkdir(mode=0o700, exist_ok=True)
     with (DEPLOY / 'deploy.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if args.activate_prepared:
+            activate_prepared()
+            return
         if subprocess.run(['pgrep', '-x', 'cargo'], stdout=subprocess.DEVNULL).returncode == 0:
             raise RuntimeError('another U1 Cargo build is running; wait for its completion')
         archive = DEPLOY / 'incoming/source.tar.gz'
@@ -405,6 +589,7 @@ def remote(args):
         remove_owned(source, DEPLOY)
         staging.rename(source)
         (DEPLOY / 'source-manifest.json').write_text(json.dumps(manifest, sort_keys=True))
+        seeded_files = install_cargo_seed(source) if args.seed_cargo_cache else 0
         external_stage = None
         if args.external_build:
             if (OUTER_BUILD_PARENT.is_symlink() or not OUTER_BUILD_PARENT.is_dir()
@@ -430,11 +615,18 @@ def remote(args):
                    CARGO_INCREMENTAL='0', CARGO_PROFILE_TEST_DEBUG='0',
                    CARGO_BUILD_JOBS=str(args.jobs))
         receipt = {'archive_sha256': args.archive_sha256, 'source_files': len(manifest),
+                   'dependency_cache_seeded_files': seeded_files,
                    'unit': UNIT, 'status': 'building', 'started_at': time.time(),
                    'test_scope': 'local_targeted_only' if args.quick else 'u1_offline_full'}
         log_path = DEPLOY / 'build.log'
         try:
             with log_path.open('w') as log:
+                if args.fetch_dependencies:
+                    # Explicit build preparation only. Compilation below stays
+                    # locked and offline; no product source or credentials are
+                    # sent to an exchange or package registry.
+                    run(['nice', '-n', '10', 'cargo', 'fetch', '--locked'],
+                        cwd=source, env=env, stdout=log, stderr=log)
                 if not args.quick:
                     run(['nice', '-n', '10', 'cargo', 'test', '--offline', '--locked',
                          '-p', 'marketcow-core', '-p', 'marketcow-polymarket',
@@ -442,9 +634,16 @@ def remote(args):
                     run(['nice', '-n', '10', 'cargo', 'test', '--offline', '--locked',
                          '-p', 'marketcowd', '--bins', '--quiet'], cwd=source,
                         env=env, stdout=log, stderr=log)
+                elif args.binance_proxy:
+                    run(['nice', '-n', '10', 'cargo', 'test', '--offline', '--locked',
+                         '-p', 'marketcowd', '--bin', 'marketcow-discovery-collector',
+                         'btc_network::tests', '--quiet'], cwd=source,
+                        env=env, stdout=log, stderr=log)
+                migration_build = (['--bin', 'marketcow-btc-db-migrate']
+                                   if args.migrate_typed_btc else [])
                 run(['nice', '-n', '10', 'cargo', 'build', '--offline', '--locked',
                      '--release', '-p', 'marketcowd', '--bin',
-                     'marketcow-discovery-collector'], cwd=source, env=env,
+                     'marketcow-discovery-collector', *migration_build], cwd=source, env=env,
                     stdout=log, stderr=log)
             binary = target / 'release/marketcow-discovery-collector'
             with binary.open('rb') as stream:
@@ -459,6 +658,20 @@ def remote(args):
             if sha(binary) != sha(candidate):
                 raise RuntimeError('isolated build output changed during installation copy')
             receipt['binary_sha256'] = sha(candidate)
+            migration_candidate = current / 'btc-db-migrate.new'
+            if args.migrate_typed_btc:
+                migration_binary = target / 'release/marketcow-btc-db-migrate'
+                with migration_binary.open('rb') as stream:
+                    migration_elf = stream.read(20)
+                if (migration_elf[:6] != b'\x7fELF\x02\x01'
+                        or int.from_bytes(migration_elf[18:20], 'little') != 62):
+                    raise RuntimeError('typed migration output must be ELF64 little-endian x86-64')
+                if migration_candidate.is_symlink():
+                    raise RuntimeError('unsafe typed migration candidate')
+                shutil.copyfile(migration_binary, migration_candidate)
+                migration_candidate.chmod(0o755)
+                if sha(migration_candidate) != sha(migration_binary):
+                    raise RuntimeError('typed migration installation copy changed')
             receipt['build_volume'] = ('outer_ntfs_ephemeral' if args.external_build
                                        else 'runtime_ext4')
         finally:
@@ -486,7 +699,59 @@ def remote(args):
                                str(credentials) if credentials is not None else None,
                                args.btc_5m_clients, str(polynode_key) if polynode_key else None,
                                disable_polynode=args.disable_btc_polynode)
+        if args.sdk_listen:
+            policy = Path(args.sdk_access_policy)
+            metadata = policy.lstat()
+            if (not policy.is_file() or policy.is_symlink() or metadata.st_uid != os.geteuid()
+                    or metadata.st_mode & 0o077 or not 1 <= metadata.st_size <= 65536):
+                raise RuntimeError('SDK policy must be an owner-private bounded regular file')
+            updated = with_sdk_listener(updated, args.sdk_listen, args.sdk_access_policy)
+            receipt['sdk_listen'] = args.sdk_listen
+        if args.binance_proxy:
+            run(['systemctl', '--user', 'is-active', '--quiet', 'marketcow-binance-proxy.service'])
+            updated = with_binance_proxy(updated, args.binance_proxy)
+            receipt['binance_proxy'] = args.binance_proxy
+        if args.migrate_typed_btc:
+            typed_migration_root(updated)  # Validate before stopping the writer.
+            try:
+                # The potentially long initial import runs before acquisition
+                # is stopped. Do not turn a schema migration into a minutes-long
+                # avoidable source gap. Durable row checkpoints skip this prefix
+                # during the short final handoff pass.
+                run_typed_migrations(updated, migration_candidate, receipt, phase='prepare')
+            except Exception as error:
+                receipt.update(status='typed_migration_prepare_failed', failed_at=time.time(),
+                               error=str(error))
+                (DEPLOY / 'receipt.json').write_text(json.dumps(receipt, sort_keys=True, indent=2))
+                remove_owned(migration_candidate, current)
+                raise
+        if args.prepare_only:
+            for name, body in (('prepared-unit', updated), ('prepared-unit-original', unit)):
+                path = DEPLOY / name
+                path.write_text(body)
+                path.chmod(0o600)
+            executable = (current / 'marketcow-discovery-collector').stat()
+            prepared = candidate.stat()
+            receipt.update(status='prepared', prepared_at=time.time(),
+                           previous_executable=[executable.st_dev, executable.st_ino],
+                           prepared_executable=[prepared.st_dev, prepared.st_ino, prepared.st_size],
+                           external_build=args.external_build)
+            (DEPLOY / 'receipt.json').write_text(json.dumps(receipt, sort_keys=True, indent=2))
+            if not args.external_build:
+                remove_owned(target, DEPLOY)
+            print(json.dumps(receipt, sort_keys=True), flush=True)
+            return
         run(['systemctl', '--user', 'stop', UNIT])
+        if args.migrate_typed_btc:
+            try:
+                run_typed_migrations(updated, migration_candidate, receipt, phase='handoff')
+            except Exception as error:
+                receipt.update(status='typed_migration_failed', failed_at=time.time(),
+                               error=str(error))
+                (DEPLOY / 'receipt.json').write_text(json.dumps(receipt, sort_keys=True, indent=2))
+                raise
+            finally:
+                remove_owned(migration_candidate, current)
         if args.uk_polymarket_ws_route:
             receipt['polymarket_ws_route'] = pin_uk_polymarket_ws_route()
         candidate.replace(current / 'marketcow-discovery-collector')
@@ -538,14 +803,92 @@ def remote(args):
         print(json.dumps(receipt, sort_keys=True), flush=True)
 
 
+def activate_prepared():
+    """Install the exact already-verified inode after a coordinated window.
+
+    No rebuild, source reupload, business data hashing or account mutations.
+    Refuse any unit/binary drift; the ordinary build guards ran at preparation.
+    """
+    receipt = json.loads((DEPLOY / 'receipt.json').read_text())
+    if receipt.get('status') != 'prepared':
+        raise RuntimeError('no exclusively prepared candidate')
+    current = DEPLOY / 'current'
+    candidate = current / 'collector.new'
+    unit_path = Path.home() / '.config/systemd/user' / UNIT
+    updated = (DEPLOY / 'prepared-unit').read_text()
+    if unit_path.read_bytes() != (DEPLOY / 'prepared-unit-original').read_bytes():
+        raise RuntimeError('unit changed after preparation; do not stop source')
+    old = (current / 'marketcow-discovery-collector').stat()
+    new = candidate.stat()
+    if ([old.st_dev, old.st_ino] != receipt['previous_executable']
+            or [new.st_dev, new.st_ino, new.st_size] != receipt['prepared_executable']
+            or candidate.is_symlink()):
+        raise RuntimeError('prepared executable identity drift; do not stop source')
+    if shutil.disk_usage(ROOT).free < 2 * 1024**3:
+        raise RuntimeError('2GiB installation/archive guard')
+    # Files live under the private deployment root. Policies are checked again
+    # by the collector before serving any authenticated public requests.
+    run(['systemctl', '--user', 'stop', UNIT])
+    candidate.replace(current / 'marketcow-discovery-collector')
+    shutil.copyfile(DEPLOY / 'source/scripts/run_with_bounded_log.py', current / 'run_with_bounded_log.py')
+    unit_path.write_text(updated)
+    unit_path.chmod(0o600)
+    run(['systemctl', '--user', 'daemon-reload'])
+    run(['systemctl', '--user', 'reset-failed', UNIT])
+    run(['systemctl', '--user', 'start', UNIT])
+    listen = re.search(r'--public-listen\s+([^\s\\]+)', updated)
+    if not listen:
+        raise RuntimeError('internal listener absent')
+    url = 'http://' + listen.group(1) + '/v3/btc/capabilities'
+    for _ in range(30):
+        probe = subprocess.run(['curl', '-fsS', '--max-time', '3', url], capture_output=True)
+        if probe.returncode == 0:
+            (DEPLOY / 'startup-status.json').write_bytes(probe.stdout)
+            break
+        time.sleep(2)
+    else:
+        raise RuntimeError('prepared source failed startup')
+    pid = int(subprocess.check_output(['systemctl', '--user', 'show', UNIT, '-p', 'MainPID', '--value']))
+    children = subprocess.check_output(['pgrep', '-P', str(pid)], text=True).split()
+    if not any(os.path.samefile(Path('/proc') / child / 'exe', current / 'marketcow-discovery-collector') for child in children):
+        raise RuntimeError('running executable is not the installed inode')
+    for _ in range(5):
+        time.sleep(2)
+        state = dict(line.split('=', 1) for line in subprocess.check_output(
+            ['systemctl', '--user', 'show', UNIT, '-p', 'MainPID', '-p', 'NRestarts', '-p', 'ActiveState'], text=True).splitlines())
+        if state.get('ActiveState') != 'active' or int(state.get('MainPID', 0)) != pid or int(state.get('NRestarts', -1)) != 0:
+            raise RuntimeError('prepared source startup restart churn')
+    receipt.update(status='started', main_pid=pid, startup_no_restart_seconds=10,
+                   installed_inode=[new.st_dev, new.st_ino], finished_at=time.time())
+    receipt['removed_paths'] = cleanup_previous_versions()
+    remove_owned(DEPLOY / 'incoming', DEPLOY)
+    (DEPLOY / 'receipt.json').write_text(json.dumps(receipt, sort_keys=True, indent=2))
+    print(json.dumps(receipt, sort_keys=True), flush=True)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--host', default='czx@u1')
+    phases = parser.add_mutually_exclusive_group()
+    phases.add_argument('--prepare-only', action='store_true', help='build verified candidate without stopping source')
+    phases.add_argument('--activate-prepared', action='store_true', help='install exact prepared candidate without rebuilding')
+    parser.add_argument('--sdk-listen', choices=['127.0.0.1:18793'],
+                        help='add a dedicated SDK boundary; preserve internal LAN listener')
+    parser.add_argument('--sdk-access-policy', choices=[str(DEPLOY / 'private/sdk-access.pb')],
+                        help='existing owner-private SDK Proto policy on U1, never uploaded')
+    parser.add_argument('--binance-proxy', choices=['http://127.0.0.1:17892'],
+                        help='route only Binance transports through the dedicated proxy')
     parser.add_argument('--jobs', type=int, choices=range(1, 9), default=2)
     parser.add_argument('--quick', action='store_true',
                         help='skip full offline test suite after targeted local verification')
     parser.add_argument('--external-build', action='store_true',
                         help='build in an ephemeral outer NTFS directory with separate space guards')
+    parser.add_argument('--migrate-typed-btc', action='store_true',
+                        help='explicitly import the last 40 minutes from existing BTC query databases before starting the new collector')
+    parser.add_argument('--fetch-dependencies', action='store_true',
+                        help='explicitly prefetch locked build dependencies before the unchanged offline compilation')
+    parser.add_argument('--seed-cargo-cache', action='store_true',
+                        help='seed missing locked public crate archives and index records from the local cache; offline build and Cargo checks remain enabled')
     parser.add_argument('--configure-btc-research-clients', type=int, choices=range(1, 65),
                         help='change only existing BTC client budget, verify same ELF; no rebuild')
     parser.add_argument('--memory-replay-bytes', type=int, choices=(2 * 1024**3, 6 * 1024**3))
@@ -566,6 +909,12 @@ if __name__ == '__main__':
     parser.add_argument('--remote', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--archive-sha256', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.prepare_only and args.migrate_typed_btc:
+        parser.error('split-phase SDK deployment must not migrate live databases')
+    if bool(args.sdk_listen) != bool(args.sdk_access_policy):
+        parser.error('SDK listener and policy must be supplied together')
+    if args.fetch_dependencies and args.seed_cargo_cache:
+        parser.error('choose network prefetch or local locked cache seed, not both')
     if args.configure_btc_research_clients is not None:
         configure_btc_research_clients(args)
         raise SystemExit(0)

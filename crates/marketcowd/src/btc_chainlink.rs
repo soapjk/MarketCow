@@ -112,6 +112,29 @@ impl Service {
         service
     }
 
+    pub async fn typed_source_health(&self, now_ms: i64) -> typed::SourceHealth {
+        let state = self.state.read().await;
+        let latest = state.points.back().map(|p| p.source_time_ms);
+        // Availability atomics do NOT tell us the persisted high-water mark.
+        // Leave success timestamps/IDs absent rather than substitute live data.
+        let writer = |available: bool, drops: u64| typed_contract::history::Health {
+            state: if available { "accepting" } else { "unavailable" }.into(),
+            reason: None, last_success_sequence: None, last_success_source_time_ms: None,
+            failed_at_ns: None, dropped_records: drops,
+        };
+        typed::SourceHealth {
+            source: typed_contract::common::Source::ChainlinkBtcUsdTwap60 as i32,
+            instrument_id: "BTCUSD.CHAINLINK.TWAP60".into(), phase: state.phase.into(),
+            reason: (state.phase != "live").then(|| state.phase.into()),
+            stream_id: Some(state.typed_generation.clone()), stream_sequence: Some(state.stream_serial),
+            source_sequence: state.last_seq, latest_source_time_ms: latest,
+            signed_source_age_ms: latest.and_then(|t| now_ms.checked_sub(t)),
+            database: self.database.as_ref().map(|_| writer(
+                self.database_available.load(Ordering::Relaxed), self.database_gaps.load(Ordering::Relaxed))),
+            archive: Some(writer(self.archive_available.load(Ordering::Relaxed),
+                self.archive_gaps.load(Ordering::Relaxed))),
+        }
+    }
     pub async fn typed_snapshot_and_subscribe(&self)->Result<(Arc<crate::btc_typed::Published>,broadcast::Receiver<Arc<crate::btc_typed::Published>>)> {
         let state=self.state.read().await;
         let receiver=self.typed_live.subscribe();

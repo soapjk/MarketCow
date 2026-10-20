@@ -10,7 +10,10 @@ message Range {
   uint64 through_trade_id = 4;
   uint32 limit = 5;
 }
-message PageRequest { Range range = 1; optional string page_token = 2; }
+message PageRequest {
+  Range range = 1; optional string page_token = 2;
+  optional string request_id = 3; // Stable UUID per logical freeze, not a content hash.
+}
 message MissingRange { uint64 first_trade_id = 1; uint64 last_trade_id = 2; }
 message Health {
   string state = 1;
@@ -40,13 +43,36 @@ message Page {
   Health database_health_at_freeze = 17;
   Health archive_health_at_freeze = 18;
   uint64 database_revision = 19; // Frozen-range repair revision, NOT append watermark.
+  optional string request_id = 20; // Echo when request-scoped session ownership is used.
 }
-message ReleaseRequest { string session_id = 1; Range range = 2; }
+message ReleaseRequest { string session_id = 1; Range range = 2; optional string request_id = 3; }
 message ReleaseReceipt {
   string schema_version = 1;
   string session_id = 2;
   Range range = 3;
   bool released = 4;
+  optional string request_id = 5;
+}
+// SDK convenience: indexed DB boundary lookup, never a JSONL scan or download.
+message TimeRangeQuery {
+  marketcow.common.v1.Source source = 1;
+  string instrument_id = 2;
+  int64 start_time_ms = 3;
+  optional int64 end_time_ms = 4; // Exclusive. Absent = persisted DB highwater, NOT now/WS.
+  uint32 limit = 5;
+  optional uint64 maximum_trade_id = 6; // Bind subsequent subranges to one upper boundary.
+  optional RevisionFence revision_fence = 7; // Only in-range repairs invalidate; appends do not.
+}
+message RevisionFence { uint64 first_trade_id = 1; uint64 last_trade_id = 2; uint64 revision = 3; }
+message ResolvedRange {
+  string schema_version = 1; // marketcow.btc-trade-range.v3
+  TimeRangeQuery query = 2;
+  Range range = 3;
+  int64 end_time_ms = 4;
+  uint64 database_high_trade_id = 5;
+  int64 database_high_source_time_ms = 6;
+  Health database_health_at_resolve = 7;
+  RevisionFence range_revision = 8;
 }
 message EvidenceRequest { string evidence_id = 1; }
 message Evidence {
@@ -67,13 +93,31 @@ message ObservationRange {
   int64 start_time_ms = 3; // Inclusive source time.
   int64 end_time_ms = 4; // Exclusive source time; immutable for every page.
   uint32 limit = 5;
+  optional uint64 maximum_observation_id = 6; // Fixed DB high-water, not supplier sequence.
+}
+message ObservationRangeQuery {
+  marketcow.common.v1.Source source = 1;
+  string instrument_id = 2;
+  int64 start_time_ms = 3;
+  int64 end_time_ms = 4;
+  uint32 limit = 5;
+}
+message ResolvedObservationRange {
+  string schema_version = 1; // marketcow.btc-observation-range.v3
+  ObservationRangeQuery query = 2;
+  uint64 maximum_observation_id = 3;
+  uint64 total_observations = 4;
 }
 message ObservationRecord {
   uint64 observation_id = 1;
   string source_generation = 2;
   marketcow.btc.v3.Observation observation = 3;
 }
-message ObservationPageRequest { ObservationRange range = 1; optional string page_token = 2; }
+message ObservationPageRequest {
+  ObservationRange range = 1;
+  optional string page_token = 2;
+  optional string request_id = 3; // UUID, reused after lost responses.
+}
 message ObservationPage {
   string schema_version = 1; // marketcow.btc-observation-history.v3
   ObservationRange range = 2;
@@ -84,6 +128,21 @@ message ObservationPage {
   optional string reason = 7;
   uint64 frozen_high_observation_id = 8;
   Health database_health_at_freeze = 9;
+  string session_id = 10;
+  optional string request_id = 11;
+  uint32 session_ttl_seconds = 12;
+}
+message ObservationReleaseRequest {
+  string session_id = 1;
+  ObservationRange range = 2;
+  optional string request_id = 3;
+}
+message ObservationReleaseReceipt {
+  string schema_version = 1; // marketcow.btc-observation-history-release.v3
+  string session_id = 2;
+  ObservationRange range = 3;
+  optional string request_id = 4;
+  bool released = 5; // false is an idempotent already-absent acknowledgement.
 }
 // History pages never inline original payloads. Evidence is an explicit
 // independent audit request. Normal reads use DB columns and indexes only.

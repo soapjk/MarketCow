@@ -18,6 +18,20 @@ pub const MAX_PAGES: usize = 1024;
 pub const PAGE_BYTES: usize = 4 * 1024 * 1024;
 pub const SESSION_BYTES: usize = 1024 * 1024 * 1024;
 pub const BUILD_TIME: Duration = Duration::from_secs(120);
+// Public customers share at most two slots across both history kinds, with
+// one outstanding frozen session per customer. Internal callers retain the
+// original per-kind four-slot limit and cannot be evicted by public traffic.
+fn admit_public<'a>(owners: impl Iterator<Item = Option<&'a str>>, owner: Option<&str>) -> Result<()> {
+    if let Some(owner) = owner {
+        let mut public = 0;
+        for existing in owners.flatten() {
+            ensure!(existing != owner, "session_customer_capacity");
+            public += 1;
+        }
+        ensure!(public < 2, "session_public_capacity");
+    }
+    Ok(())
+}
 struct PageRange {
     first: u64,
     last: u64,
@@ -25,6 +39,8 @@ struct PageRange {
 }
 pub struct Session {
     id: String,
+    owner: Option<String>,
+    request_id: Option<String>,
     range: history::Range,
     created: Instant,
     revision: u64,
@@ -46,6 +62,8 @@ pub struct Service {
 }
 struct ObservationSession {
     id: String,
+    owner: Option<String>,
+    request_id: Option<String>,
     range: history::ObservationRange,
     created: Instant,
     high: i64,
@@ -222,7 +240,9 @@ fn freeze(
     drop(stmt);
     tx.commit()?;
     Ok(Session {
+        owner: None,
         id: uuid::Uuid::new_v4().to_string(),
+        request_id: None,
         range,
         created: Instant::now(),
         revision,
@@ -240,6 +260,43 @@ fn freeze(
     })
 }
 impl Service {
+    /// Index-only boundary lookup in one SQLite read transaction. Does not
+    /// allocate a session, scan archives, or call an upstream provider.
+    pub fn resolve_range(&self,query:&history::TimeRangeQuery,health:Option<history::Health>)->Result<history::ResolvedRange> {
+        ensure!(query.source==common::Source::BinanceSpotTrade as i32 && query.instrument_id=="BTCUSDT.BINANCE"
+            && query.start_time_ms>0 && (1..=1000).contains(&query.limit),"invalid history range");
+        let bound=query.maximum_trade_id.map(i64::try_from).transpose()?.unwrap_or(i64::MAX);
+        let mut db=store::open_reader(&self.path)?;
+        let tx=db.transaction()?;
+        let (high,high_time):(i64,i64)=tx.query_row("SELECT trade_id,trade_time_ms FROM typed_binance_trades WHERE trade_id<=? ORDER BY trade_id DESC LIMIT 1",
+            [bound],|r|Ok((r.get(0)?,r.get(1)?))).optional()?.context("database_history_empty")?;
+        if query.maximum_trade_id.is_some() {ensure!(high==bound,"database_write_lag");}
+        let latest_end=high_time.checked_add(1).context("invalid history range")?;
+        let end=query.end_time_ms.unwrap_or(latest_end);
+        ensure!(end>query.start_time_ms,"invalid history range");
+        ensure!(end<=high_time || (end==latest_end && (query.end_time_ms.is_none() || query.maximum_trade_id.is_some())),"database_write_lag");
+        let through:Option<i64>=tx.query_row("SELECT trade_id FROM typed_binance_trades INDEXED BY typed_binance_time_id WHERE trade_time_ms<? AND trade_id<=? ORDER BY trade_time_ms DESC,trade_id DESC LIMIT 1",
+            params![end,high],|r|r.get(0)).optional()?;
+        let through=through.context("database_history_empty")?;
+        if through<high {
+            let next:Option<(i64,i64)>=tx.query_row("SELECT trade_id,trade_time_ms FROM typed_binance_trades WHERE trade_id>? AND trade_id<=? ORDER BY trade_id LIMIT 1",
+                params![through,high],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            ensure!(next.is_some_and(|(id,time)|id==through+1 && time>=end),"history_boundary_gap");
+        }
+        let predecessor:Option<i64>=tx.query_row("SELECT trade_id FROM typed_binance_trades INDEXED BY typed_binance_time_id WHERE trade_time_ms<? AND trade_id<=? ORDER BY trade_time_ms DESC,trade_id DESC LIMIT 1",
+            params![query.start_time_ms,through],|r|r.get(0)).optional()?;
+        let range_revision=history::RevisionFence {first_trade_id:predecessor.unwrap_or(0).try_into()?,last_trade_id:through.try_into()?,
+            revision:revision(&tx,predecessor.unwrap_or(0).try_into()?,through.try_into()?)?};
+        if let Some(fence)=&query.revision_fence {
+            ensure!(fence.first_trade_id<=fence.last_trade_id && fence.last_trade_id<=high as u64,"invalid history range");
+            ensure!(revision(&tx,fence.first_trade_id,fence.last_trade_id)?==fence.revision,"session_invalidated");
+        }
+        tx.commit()?;
+        Ok(history::ResolvedRange {schema_version:"marketcow.btc-trade-range.v3".into(),query:Some(query.clone()),
+            range:Some(history::Range {source:query.source,instrument_id:query.instrument_id.clone(),start_time_ms:query.start_time_ms,
+                through_trade_id:through.try_into()?,limit:query.limit}),end_time_ms:end,database_high_trade_id:high.try_into()?,
+            database_high_source_time_ms:high_time,database_health_at_resolve:health,range_revision:Some(range_revision)})
+    }
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
@@ -260,7 +317,36 @@ impl Service {
         &self,
         request: &history::ObservationPageRequest,
     ) -> Result<history::ObservationPage> {
+        self.read_observations_for_owner(request,None)
+    }
+    pub fn resolve_observations(&self,query:&history::ObservationRangeQuery)
+        ->Result<history::ResolvedObservationRange> {
+        let source=common::Source::try_from(query.source)?;
+        ensure!(matches!(source,common::Source::ChainlinkBtcUsd|common::Source::ChainlinkBtcUsdTwap60)
+            && query.instrument_id==if source==common::Source::ChainlinkBtcUsd {"BTCUSD.CHAINLINK"}else{"BTCUSD.CHAINLINK.TWAP60"}
+            && query.start_time_ms>0 && query.end_time_ms>query.start_time_ms
+            && (1..=1000).contains(&query.limit),"invalid history range");
+        let mut db=store::open_reader(&self.observation_path()?)?;let tx=db.transaction()?;
+        let high:Option<i64>=tx.query_row("SELECT MAX(observation_id) FROM typed_chainlink_observations WHERE source=?",
+            [query.source],|r|r.get(0))?;
+        let high=high.context("source_not_collected")?;
+        let count:i64=tx.query_row("SELECT COUNT(*) FROM (SELECT 1 FROM typed_chainlink_observations WHERE source=? AND source_time_ms>=? AND source_time_ms<? AND observation_id<=? LIMIT ?)",
+            params![query.source,query.start_time_ms,query.end_time_ms,high,i64::try_from(MAX_ROWS+1)?],|r|r.get(0))?;
+        ensure!(count>=0 && count as u64<=MAX_ROWS,"history_observation_capacity");tx.commit()?;
+        Ok(history::ResolvedObservationRange {schema_version:"marketcow.btc-observation-range.v3".into(),
+            query:Some(query.clone()),maximum_observation_id:high.try_into()?,total_observations:count.try_into()?})
+    }
+    pub fn read_observations_for_owner(&self,request:&history::ObservationPageRequest,owner:Option<&str>)
+        -> Result<history::ObservationPage> {
+        // Both kinds serialize new-session admission, not pagination. This
+        // prevents two simultaneous first requests bypassing customer limits.
+        let _build = if request.page_token.is_none() {
+            Some(self.build.try_lock().map_err(|_| anyhow::anyhow!("history_capacity"))?)
+        } else { None };
         use marketcow_contracts::typed_v3::btc;
+        if let Some(id) = &request.request_id {
+            ensure!(uuid::Uuid::parse_str(id).is_ok(), "invalid_request_id");
+        }
         let range = request.range.as_ref().context("missing history range")?;
         let source = common::Source::try_from(range.source)?;
         ensure!(
@@ -280,6 +366,11 @@ impl Service {
             "invalid history range"
         );
         let path = self.observation_path()?;
+        let trade_owners: Vec<String> = if request.page_token.is_none() && owner.is_some() {
+            let mut trades = self.sessions.lock().map_err(|_| anyhow::anyhow!("session owner poisoned"))?;
+            trades.retain(|_, s| s.created.elapsed() < TTL);
+            trades.values().filter_map(|s|s.owner.clone()).collect()
+        } else { Vec::new() };
         let mut db = store::open_reader(&path)?;
         let tx = db.transaction()?;
         let (session, after) = if let Some(token) = &request.page_token {
@@ -295,6 +386,8 @@ impl Service {
                 .cloned()
                 .context("session_expired_or_unknown")?;
             ensure!(&session.range == range, "session_range_mismatch");
+            ensure!(session.owner.as_deref()==owner,"session_owner_mismatch");
+            ensure!(session.request_id == request.request_id, "session_request_mismatch");
             ensure!(
                 after >= session.first.saturating_sub(1) && after <= session.high,
                 "invalid page index"
@@ -306,14 +399,22 @@ impl Service {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session owner poisoned"))?;
             sessions.retain(|_, s| s.created.elapsed() < TTL);
-            if let Some(session) = sessions.values().find(|s| &s.range == range).cloned() {
+            let reusable = sessions.values().filter(|s|s.owner.as_deref()==owner).find(|s| match &request.request_id {
+                Some(id) => s.request_id.as_ref() == Some(id),
+                None => s.request_id.is_none() && &s.range == range,
+            }).cloned();
+            if let Some(session) = reusable {
+                ensure!(&session.range == range, "session_range_mismatch");
                 let after = session.first.saturating_sub(1);
                 (session, after)
             } else {
+                admit_public(trade_owners.iter().map(|s|Some(s.as_str()))
+                    .chain(sessions.values().map(|s|s.owner.as_deref())),owner)?;
                 ensure!(sessions.len() < 4, "session_capacity");
                 let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM typed_chainlink_observations WHERE source=? LIMIT 1)",[range.source],|r|r.get(0))?;
                 ensure!(exists, "source_not_collected");
-                let (first,high,count,bytes):(Option<i64>,Option<i64>,i64,i64)=tx.query_row("SELECT MIN(observation_id),MAX(observation_id),COUNT(*),COALESCE(SUM(length(price)+length(source_generation)+length(evidence_id)+192),0) FROM typed_chainlink_observations WHERE source=? AND source_time_ms>=? AND source_time_ms<?",params![range.source,range.start_time_ms,range.end_time_ms],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+                let maximum=range.maximum_observation_id.map(i64::try_from).transpose()?.unwrap_or(i64::MAX);
+                let (first,high,count,bytes):(Option<i64>,Option<i64>,i64,i64)=tx.query_row("SELECT MIN(observation_id),MAX(observation_id),COUNT(*),COALESCE(SUM(length(price)+length(source_generation)+length(evidence_id)+192),0) FROM typed_chainlink_observations WHERE source=? AND source_time_ms>=? AND source_time_ms<? AND observation_id<=?",params![range.source,range.start_time_ms,range.end_time_ms,maximum],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
                 ensure!(
                     count >= 0 && count as u64 <= MAX_ROWS,
                     "history_observation_capacity"
@@ -329,7 +430,9 @@ impl Service {
                 let first = first.unwrap_or(1);
                 let high = high.unwrap_or(0);
                 let session = Arc::new(ObservationSession {
+                    owner: owner.map(str::to_owned),
                     id: uuid::Uuid::new_v4().to_string(),
+                    request_id: request.request_id.clone(),
                     range: range.clone(),
                     created: Instant::now(),
                     high,
@@ -396,9 +499,38 @@ impl Service {
             reason: Some("observation_prefix_coverage_unverified".into()),
             frozen_high_observation_id: session.high.try_into()?,
             database_health_at_freeze: session.health.clone(),
+            session_id: session.id.clone(),
+            request_id: session.request_id.clone(),
+            session_ttl_seconds: TTL.as_secs() as u32,
         };
         ensure!(value.encoded_len() <= PAGE_BYTES, "history_page_bytes");
         Ok(value)
+    }
+    pub fn release_observations(&self, request: &history::ObservationReleaseRequest)
+        -> Result<history::ObservationReleaseReceipt> {
+        self.release_observations_for_owner(request,None)
+    }
+    pub fn release_observations_for_owner(&self,request:&history::ObservationReleaseRequest,owner:Option<&str>)
+        -> Result<history::ObservationReleaseReceipt> {
+        ensure!(uuid::Uuid::parse_str(&request.session_id).is_ok(), "release session identity");
+        let range = request.range.as_ref().context("missing release range")?;
+        if let Some(id) = &request.request_id {
+            ensure!(uuid::Uuid::parse_str(id).is_ok(), "invalid_request_id");
+        }
+        let mut sessions = self.observations.lock()
+            .map_err(|_| anyhow::anyhow!("session owner poisoned"))?;
+        sessions.retain(|_, s| s.created.elapsed() < TTL);
+        if let Some(session) = sessions.get(&request.session_id) {
+            ensure!(session.owner.as_deref()==owner,"session_owner_mismatch");
+            ensure!(&session.range == range, "session_range_mismatch");
+            ensure!(session.request_id == request.request_id, "session_request_mismatch");
+        }
+        let released = sessions.remove(&request.session_id).is_some();
+        Ok(history::ObservationReleaseReceipt {
+            schema_version: "marketcow.btc-observation-history-release.v3".into(),
+            session_id: request.session_id.clone(), range: Some(range.clone()),
+            request_id: request.request_id.clone(), released,
+        })
     }
     pub fn create(
         &self,
@@ -413,7 +545,18 @@ impl Service {
         archive_health: Option<history::Health>,
         database_health: Option<history::Health>,
     ) -> Result<history::Page> {
+        self.create_request_with_health(range,archive_health,database_health,None)
+    }
+    pub fn create_request_with_health(
+        &self,range:history::Range,archive_health:Option<history::Health>,
+        database_health:Option<history::Health>,request_id:Option<String>,
+    )->Result<history::Page> {
+        self.create_for_owner(range,archive_health,database_health,request_id,None)
+    }
+    pub fn create_for_owner(&self,range:history::Range,archive_health:Option<history::Health>,
+        database_health:Option<history::Health>,request_id:Option<String>,owner:Option<&str>)->Result<history::Page> {
         validate_range(&range)?;
+        if let Some(id)=&request_id {ensure!(uuid::Uuid::parse_str(id).is_ok(),"invalid_request_id");}
         // Session map is never held during DB work. One bounded build is
         // admitted immediately; callers do not queue behind a global wait.
         let reusable = {
@@ -422,7 +565,10 @@ impl Service {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session owner poisoned"))?;
             sessions.retain(|_, s| s.created.elapsed() < TTL);
-            if let Some(s) = sessions.values().find(|s| s.range == range) {
+            if let Some(s) = sessions.values().filter(|s|s.owner.as_deref()==owner).find(|s| match &request_id {
+                Some(id)=>s.request_id.as_ref()==Some(id),None=>s.request_id.is_none() && s.range==range,
+            }) {
+                ensure!(s.range==range,"session_request_mismatch");
                 Some(s.clone())
             } else {
                 ensure!(sessions.len() < 4, "session_capacity");
@@ -436,7 +582,20 @@ impl Service {
             .build
             .try_lock()
             .map_err(|_| anyhow::anyhow!("history_capacity"))?;
-        let session = Arc::new(freeze(&self.path, range, archive_health, database_health)?);
+        // Admission is checked again under the shared build guard. A reader
+        // may still release a session while the database is being scanned.
+        {
+            let mut sessions = self.sessions.lock().map_err(|_| anyhow::anyhow!("session owner poisoned"))?;
+            let mut observations = self.observations.lock().map_err(|_| anyhow::anyhow!("session owner poisoned"))?;
+            sessions.retain(|_,s|s.created.elapsed()<TTL);
+            observations.retain(|_,s|s.created.elapsed()<TTL);
+            admit_public(sessions.values().map(|s|s.owner.as_deref())
+                .chain(observations.values().map(|s|s.owner.as_deref())),owner)?;
+        }
+        let mut session=freeze(&self.path,range,archive_health,database_health)?;
+        session.owner=owner.map(str::to_owned);
+        session.request_id=request_id;
+        let session=Arc::new(session);
         let first = page(&self.path, &session, 0)?;
         let mut sessions = self
             .sessions
@@ -448,6 +607,9 @@ impl Service {
         Ok(first)
     }
     pub fn read(&self, request: &history::PageRequest) -> Result<history::Page> {
+        self.read_for_owner(request,None)
+    }
+    pub fn read_for_owner(&self,request:&history::PageRequest,owner:Option<&str>)->Result<history::Page> {
         let range = request.range.as_ref().context("missing history range")?;
         validate_range(range)?;
         let token = request.page_token.as_ref().context("missing page token")?;
@@ -462,10 +624,15 @@ impl Service {
             sessions.get(id).cloned()
         };
         let session = session.context("session_expired_or_unknown")?;
+        ensure!(session.owner.as_deref()==owner,"session_owner_mismatch");
         ensure!(&session.range == range, "session_range_mismatch");
+        ensure!(session.request_id==request.request_id,"session_request_mismatch");
         page(&self.path, &session, index)
     }
     pub fn release(&self, request: &history::ReleaseRequest) -> Result<history::ReleaseReceipt> {
+        self.release_for_owner(request,None)
+    }
+    pub fn release_for_owner(&self,request:&history::ReleaseRequest,owner:Option<&str>)->Result<history::ReleaseReceipt> {
         let range = request.range.as_ref().context("missing release range")?;
         validate_range(range)?;
         ensure!(
@@ -478,7 +645,9 @@ impl Service {
             .map_err(|_| anyhow::anyhow!("session owner poisoned"))?;
         sessions.retain(|_, s| s.created.elapsed() < TTL);
         if let Some(s) = sessions.get(&request.session_id) {
+            ensure!(s.owner.as_deref()==owner,"session_owner_mismatch");
             ensure!(&s.range == range, "session_range_mismatch");
+            ensure!(s.request_id==request.request_id,"session_request_mismatch");
         }
         let released = sessions.remove(&request.session_id).is_some();
         Ok(history::ReleaseReceipt {
@@ -486,6 +655,7 @@ impl Service {
             session_id: request.session_id.clone(),
             range: Some(range.clone()),
             released,
+            request_id:request.request_id.clone(),
         })
     }
 }
@@ -548,6 +718,7 @@ fn page(path: &Path, session: &Session, index: usize) -> Result<history::Page> {
         database_health_at_freeze: session.database_health.clone(),
         archive_health_at_freeze: session.archive_health.clone(),
         database_revision: session.revision,
+        request_id:session.request_id.clone(),
     };
     ensure!(page.encoded_len() <= PAGE_BYTES, "history_page_bytes");
     Ok(page)
@@ -557,6 +728,55 @@ fn page(path: &Path, session: &Session, index: usize) -> Result<history::Page> {
 mod native_tests {
     use super::*;
     use marketcow_contracts::typed_v3::btc;
+    #[test]
+    fn public_admission_is_bounded_across_kinds_without_limiting_internal() {
+        assert!(admit_public([Some("a"),Some("b")].into_iter(),None).is_ok());
+        assert_eq!(admit_public([Some("a")].into_iter(),Some("a")).unwrap_err().to_string(),"session_customer_capacity");
+        assert_eq!(admit_public([Some("a"),Some("b")].into_iter(),Some("c")).unwrap_err().to_string(),"session_public_capacity");
+        assert!(admit_public([None,None,None].into_iter(),Some("a")).is_ok());
+    }
+    #[test]
+    fn public_frozen_slots_reserve_internal_capacity_and_release_reopens() {
+        let (_root,_db,service,range)=setup();
+        let first=service.create_for_owner(range.clone(),None,None,None,Some("a")).unwrap();
+        // Retrying an existing identity does not consume a second slot.
+        assert_eq!(service.create_for_owner(range.clone(),None,None,None,Some("a")).unwrap().session_id,first.session_id);
+        let id=Some(uuid::Uuid::new_v4().to_string());
+        assert_eq!(service.create_for_owner(range.clone(),None,None,id,Some("a")).unwrap_err().to_string(),"session_customer_capacity");
+        service.create_for_owner(range.clone(),None,None,None,Some("b")).unwrap();
+        assert_eq!(service.create_for_owner(range.clone(),None,None,None,Some("c")).unwrap_err().to_string(),"session_public_capacity");
+        service.create_for_owner(range.clone(),None,None,Some(uuid::Uuid::new_v4().to_string()),None).unwrap();
+        service.create_for_owner(range.clone(),None,None,Some(uuid::Uuid::new_v4().to_string()),None).unwrap();
+        let release=history::ReleaseRequest{session_id:first.session_id,range:Some(range.clone()),request_id:None};
+        assert!(service.release_for_owner(&release,Some("a")).unwrap().released);
+        assert!(service.create_for_owner(range,None,None,None,Some("c")).is_ok());
+    }
+    #[test]
+    fn customer_cannot_bypass_admission_by_switching_history_kind() {
+        let (_root,_db,service,range)=setup();
+        let mut db=store::open(&service.observation_path().unwrap()).unwrap();
+        store::insert_observations(&mut db,common::Source::ChainlinkBtcUsdTwap60,"g",
+            &[btc::Observation{source_time_ms:2000,price:"100".into(),source_sequence:Some(1),row_index:Some(0),..Default::default()}],&input()).unwrap();
+        let trade=service.create_for_owner(range.clone(),None,None,None,Some("a")).unwrap();
+        let obs=history::ObservationPageRequest{range:Some(history::ObservationRange{
+            source:common::Source::ChainlinkBtcUsdTwap60 as i32,instrument_id:"BTCUSD.CHAINLINK.TWAP60".into(),
+            start_time_ms:1000,end_time_ms:3000,limit:1,maximum_observation_id:None}),page_token:None,request_id:None};
+        assert_eq!(service.read_observations_for_owner(&obs,Some("a")).unwrap_err().to_string(),"session_customer_capacity");
+        let observation=service.read_observations_for_owner(&obs,Some("b")).unwrap();
+        assert_eq!(service.create_for_owner(range.clone(),None,None,None,Some("b")).unwrap_err().to_string(),"session_customer_capacity");
+        assert_eq!(service.create_for_owner(range.clone(),None,None,None,Some("c")).unwrap_err().to_string(),"session_public_capacity");
+        // Internal observation and trade sessions remain admissible.
+        assert!(service.read_observations(&obs).is_ok());
+        assert!(service.create_for_owner(range.clone(),None,None,None,None).is_ok());
+        assert!(service.release_observations_for_owner(&history::ObservationReleaseRequest{
+            session_id:observation.session_id,range:obs.range.clone(),request_id:None},Some("b")).unwrap().released);
+        assert!(service.create_for_owner(range.clone(),None,None,None,Some("c")).is_ok());
+        // TTL expiry frees capacity without affecting another owner's session.
+        let mut sessions=service.sessions.lock().unwrap();
+        Arc::get_mut(sessions.get_mut(&trade.session_id).unwrap()).unwrap().created=Instant::now()-TTL-Duration::from_secs(1);
+        drop(sessions);
+        assert!(service.read_observations_for_owner(&obs,Some("a")).is_ok());
+    }
     fn row(id: u64) -> btc::Trade {
         btc::Trade {
             trade_id: id,
@@ -613,12 +833,14 @@ mod native_tests {
             .read(&history::PageRequest {
                 range: Some(range.clone()),
                 page_token: first.next_page_token,
+                request_id:None,
             })
             .unwrap();
         let last = service
             .read(&history::PageRequest {
                 range: Some(range.clone()),
                 page_token: second.next_page_token,
+                request_id:None,
             })
             .unwrap();
         assert!(last.complete && last.coverage_verified);
@@ -626,6 +848,7 @@ mod native_tests {
         let release = history::ReleaseRequest {
             session_id: first.session_id,
             range: Some(range),
+            request_id:None,
         };
         assert!(service.release(&release).unwrap().released);
         assert!(!service.release(&release).unwrap().released);
@@ -645,6 +868,38 @@ mod native_tests {
         assert_eq!(service.sessions.lock().unwrap().len(), 1);
     }
     #[test]
+    fn request_identity_reuses_own_freeze_and_never_releases_another_request() {
+        let (_root,_db,service,range)=setup();
+        let a=uuid::Uuid::new_v4().to_string();let b=uuid::Uuid::new_v4().to_string();
+        let first=service.create_request_with_health(range.clone(),None,None,Some(a.clone())).unwrap();
+        let retry=service.create_request_with_health(range.clone(),None,None,Some(a.clone())).unwrap();
+        assert_eq!(first.session_id,retry.session_id);
+        let other=service.create_request_with_health(range.clone(),None,None,Some(b.clone())).unwrap();
+        assert_ne!(first.session_id,other.session_id);
+        let wrong=history::ReleaseRequest {session_id:first.session_id.clone(),range:Some(range.clone()),request_id:Some(b.clone())};
+        assert_eq!(service.release(&wrong).unwrap_err().to_string(),"session_request_mismatch");
+        let right=history::ReleaseRequest {session_id:first.session_id,range:Some(range.clone()),request_id:Some(a)};
+        assert!(service.release(&right).unwrap().released);
+        let page=service.read(&history::PageRequest {range:Some(range),page_token:other.next_page_token,request_id:Some(b)}).unwrap();
+        assert_eq!(page.session_id,other.session_id);
+    }
+    #[test]
+    fn time_lookup_uses_exclusive_boundary_and_persisted_watermark() {
+        let (_root,mut db,service,range)=setup();
+        let mut query=history::TimeRangeQuery {source:range.source,instrument_id:range.instrument_id,
+            start_time_ms:1250,end_time_ms:Some(1400),limit:1000,maximum_trade_id:None,revision_fence:None};
+        let value=service.resolve_range(&query,None).unwrap();
+        assert_eq!(value.range.unwrap().through_trade_id,3);
+        query.end_time_ms=None;
+        let value=service.resolve_range(&query,None).unwrap();
+        assert_eq!(value.end_time_ms,1501);assert_eq!(value.database_high_trade_id,5);
+        store::insert_trades(&mut db,&[row(6)],&input()).unwrap();
+        query.maximum_trade_id=Some(5);query.end_time_ms=Some(1501);
+        assert_eq!(service.resolve_range(&query,None).unwrap().range.unwrap().through_trade_id,5);
+        query.maximum_trade_id=None;query.end_time_ms=Some(1700);
+        assert_eq!(service.resolve_range(&query,None).unwrap_err().to_string(),"database_write_lag");
+    }
+    #[test]
     fn native_range_binding_and_in_range_evidence_revision_are_checked() {
         let (_root, mut db, service, range) = setup();
         let first = service.create(range.clone(), None).unwrap();
@@ -654,7 +909,7 @@ mod native_tests {
             service
                 .read(&history::PageRequest {
                     range: Some(wrong.clone()),
-                    page_token: first.next_page_token.clone()
+                    page_token: first.next_page_token.clone(),request_id:None,
                 })
                 .unwrap_err()
                 .to_string(),
@@ -664,7 +919,7 @@ mod native_tests {
             service
                 .release(&history::ReleaseRequest {
                     session_id: first.session_id,
-                    range: Some(wrong)
+                    range: Some(wrong),request_id:None,
                 })
                 .is_err()
         );
@@ -675,12 +930,77 @@ mod native_tests {
             service
                 .read(&history::PageRequest {
                     range: Some(range),
-                    page_token: first.next_page_token
+                    page_token: first.next_page_token,request_id:None,
                 })
                 .unwrap_err()
                 .to_string(),
             "session_invalidated"
         );
+    }
+    #[test]
+    fn observation_request_identity_isolates_release_and_frees_slots() {
+        let (_root, _db, service, _range) = setup();
+        let mut db = store::open(&service.observation_path().unwrap()).unwrap();
+        store::insert_observations(&mut db, common::Source::ChainlinkBtcUsdTwap60,
+            "generation-a", &[btc::Observation { source_time_ms: 2000,
+                price: "100.00".into(), source_sequence: Some(1), row_index: Some(0),
+                ..Default::default() }], &input()).unwrap();
+        let range = history::ObservationRange {
+            source: common::Source::ChainlinkBtcUsdTwap60 as i32,
+            instrument_id: "BTCUSD.CHAINLINK.TWAP60".into(),
+            start_time_ms: 1000, end_time_ms: 3000, limit: 1, maximum_observation_id:None,
+        };
+        let mut request = history::ObservationPageRequest { range: Some(range.clone()),
+            page_token: None, request_id: Some(uuid::Uuid::new_v4().to_string()) };
+        let first = service.read_observations(&request).unwrap();
+        assert!(first.complete);
+        assert_eq!(first.session_id, service.read_observations(&request).unwrap().session_id);
+        let first_request = request.request_id.clone();
+        for _ in 0..3 {
+            request.request_id = Some(uuid::Uuid::new_v4().to_string());
+            assert_ne!(first.session_id, service.read_observations(&request).unwrap().session_id);
+        }
+        request.request_id = Some(uuid::Uuid::new_v4().to_string());
+        assert_eq!(service.read_observations(&request).unwrap_err().to_string(), "session_capacity");
+        let mut release = history::ObservationReleaseRequest {
+            session_id: first.session_id, range: Some(range), request_id: request.request_id.clone(),
+        };
+        assert_eq!(service.release_observations(&release).unwrap_err().to_string(), "session_request_mismatch");
+        release.request_id = first_request;
+        assert!(service.release_observations(&release).unwrap().released);
+        assert!(!service.release_observations(&release).unwrap().released);
+        assert!(service.read_observations(&request).is_ok());
+    }
+    #[test]
+    fn authenticated_history_cannot_read_or_release_another_customer() {
+        let (_root,_db,service,range)=setup();
+        let request_id=Some(uuid::Uuid::new_v4().to_string());
+        let first=service.create_for_owner(range.clone(),None,None,request_id.clone(),Some("a")).unwrap();
+        let other=service.create_for_owner(range.clone(),None,None,request_id.clone(),Some("b")).unwrap();
+        assert_ne!(first.session_id,other.session_id);
+        let read=history::PageRequest {range:Some(range.clone()),page_token:first.next_page_token,request_id:request_id.clone()};
+        assert_eq!(service.read_for_owner(&read,Some("b")).unwrap_err().to_string(),"session_owner_mismatch");
+        let release=history::ReleaseRequest {session_id:first.session_id,range:Some(range),request_id};
+        assert_eq!(service.release_for_owner(&release,Some("b")).unwrap_err().to_string(),"session_owner_mismatch");
+        assert!(service.release_for_owner(&release,Some("a")).unwrap().released);
+    }
+    #[test]
+    fn observation_time_query_freezes_high_water_across_long_segments() {
+        let (_root,_db,service,_range)=setup();let mut db=store::open(&service.observation_path().unwrap()).unwrap();
+        let source=common::Source::ChainlinkBtcUsdTwap60;
+        let row=|t,seq|btc::Observation {source_time_ms:t,price:"100.00".into(),source_sequence:Some(seq),
+            row_index:Some(0),..Default::default()};
+        store::insert_observations(&mut db,source,"a",&[row(1000,1),row(1_801_000,2)],&input()).unwrap();
+        let resolved=service.resolve_observations(&history::ObservationRangeQuery {
+            source:source as i32,instrument_id:"BTCUSD.CHAINLINK.TWAP60".into(),start_time_ms:1,
+            end_time_ms:2_000_000,limit:1000}).unwrap();assert_eq!(resolved.total_observations,2);
+        store::insert_observations(&mut db,source,"a",&[row(1_900_000,3)],&input()).unwrap();
+        let request=history::ObservationPageRequest {range:Some(history::ObservationRange {
+            source:source as i32,instrument_id:"BTCUSD.CHAINLINK.TWAP60".into(),start_time_ms:1_800_001,
+            end_time_ms:2_000_000,limit:1000,maximum_observation_id:Some(resolved.maximum_observation_id)}),
+            page_token:None,request_id:Some(uuid::Uuid::new_v4().to_string())};
+        let page=service.read_observations(&request).unwrap();assert_eq!(page.observations.len(),1);
+        assert_eq!(page.observations[0].observation.as_ref().unwrap().source_time_ms,1_801_000);
     }
     #[test]
     fn native_observation_watermark_preserves_equal_time_facts() {
@@ -704,11 +1024,13 @@ mod native_tests {
             start_time_ms: 1000,
             end_time_ms: 3000,
             limit: 1,
+            maximum_observation_id:None,
         };
         let first = service
             .read_observations(&history::ObservationPageRequest {
                 range: Some(range.clone()),
                 page_token: None,
+                request_id: None,
             })
             .unwrap();
         let mut next = rows[0].clone();
@@ -719,6 +1041,7 @@ mod native_tests {
             .read_observations(&history::ObservationPageRequest {
                 range: Some(range),
                 page_token: first.next_page_token,
+                request_id: None,
             })
             .unwrap();
         assert!(last.complete && !last.coverage_verified);

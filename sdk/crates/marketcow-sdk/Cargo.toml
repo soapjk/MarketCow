@@ -1,0 +1,25 @@
+[package]
+name = "marketcow-sdk"
+version = "0.1.2"
+edition.workspace = true
+license.workspace = true
+description = "Shared native MarketCow market-data client core"
+
+[dependencies]
+bytes.workspace = true
+futures-util.workspace = true
+http.workspace = true
+httpdate = "1"
+marketcow-wire = { path = "../marketcow-wire", version = "0.1.0" }
+prost.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls", "stream"] }
+rust_decimal.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+axum.workspace = true

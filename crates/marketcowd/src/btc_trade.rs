@@ -25,7 +25,6 @@ use std::{
 };
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio_tungstenite::{
-    connect_async_with_config,
     tungstenite::{Message, protocol::WebSocketConfig},
 };
 
@@ -301,6 +300,19 @@ impl Service {
         };
         (convert(&status["database"]),convert(&status))
     }
+    pub async fn typed_source_health(&self, now_ms: i64) -> typed::SourceHealth {
+        let state = self.state.read().await;
+        let latest = state.trades.back().map(|r| r.trade_time_ms);
+        let (database, archive) = self.typed_health();
+        typed::SourceHealth {
+            source: typed_contract::common::Source::BinanceSpotTrade as i32,
+            instrument_id: INSTRUMENT.into(), phase: state.phase.into(),
+            reason: (!state.reason.is_empty()).then(|| state.reason.clone()),
+            stream_id: Some(state.typed_generation.clone()), stream_sequence: Some(state.serial),
+            source_sequence: state.last_id, latest_source_time_ms: latest,
+            signed_source_age_ms: latest.and_then(|t| now_ms.checked_sub(t)), database, archive,
+        }
+    }
     pub async fn typed_snapshot_and_subscribe(&self) -> Result<(Arc<crate::btc_typed::Published>, broadcast::Receiver<Arc<crate::btc_typed::Published>>)> {
         let state=self.state.read().await;
         let receiver=self.typed_live.subscribe();
@@ -524,9 +536,9 @@ impl Service {
         let mut ws_config = WebSocketConfig::default();
         ws_config.max_message_size = Some(MAX_RAW_FRAME_BYTES);
         ws_config.max_frame_size = Some(MAX_RAW_FRAME_BYTES);
-        let (socket, _) = tokio::time::timeout(
+        let socket = tokio::time::timeout(
             Duration::from_secs(15),
-            connect_async_with_config(WS_URL, Some(ws_config), false),
+            crate::btc_network::connect(WS_URL, Some(ws_config)),
         )
         .await
         .context("BTC trade WS connect timeout")?
@@ -576,11 +588,7 @@ impl Service {
         rx: &mut mpsc::Receiver<Ingress>,
         overflow: &AtomicBool,
     ) -> Result<()> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .build()?;
+        let client = crate::btc_network::client(Duration::from_secs(10))?;
         let mut response = client.get(REST_URL).send().await
             .context("BTC trade REST bootstrap request failed")?
             .error_for_status().context("BTC trade REST bootstrap HTTP failed")?;

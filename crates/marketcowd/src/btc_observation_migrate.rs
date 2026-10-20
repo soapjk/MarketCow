@@ -230,8 +230,19 @@ fn main() -> Result<()> {
     let source=args.next().context("source missing")?;
     if source=="binance-typed" || source=="chainlink-typed" {
         let from=PathBuf::from(args.next().context("typed migration requires explicit existing source database")?);
-        ensure!(args.next().is_none(),"unexpected typed migration option");
-        return import_typed_database(&root,&from,source=="binance-typed");
+        let mut start=None;let mut end=None;
+        for option in args {
+            let option=option.to_str().context("typed migration option not utf8")?;
+            if let Some(value)=option.strip_prefix("--start-time-ms=") {
+                ensure!(start.replace(value.parse::<i64>()?).is_none(),"duplicate migration start");
+            }else if let Some(value)=option.strip_prefix("--end-time-ms=") {
+                ensure!(end.replace(value.parse::<i64>()?).is_none(),"duplicate migration end");
+            }else{anyhow::bail!("unexpected typed migration option")}
+        }
+        ensure!(start.is_some()==end.is_some(),"both migration boundaries required");
+        let range=start.zip(end);
+        if let Some((start,end))=range{ensure!(start>0&&end>start&&end-start<=3_600_000,"migration_range_capacity");}
+        return import_typed_database_range(&root,&from,source=="binance-typed",range);
     }
     if source=="binance-finalize" || source=="binance-finalize-staged" {
         ensure!(args.next().is_none(),"unexpected finalize option");
@@ -265,6 +276,24 @@ fn main() -> Result<()> {
 /// read or by WS ingestion. Old digest keys are opaque source row identities;
 /// no digest is computed or checked, and no archive file is opened.
 fn import_typed_database(root:&Path,from:&Path,binance:bool)->Result<()> {
+    import_typed_database_range(root,from,binance,None)
+}
+fn retry_migration_busy<T>(mut operation:impl FnMut()->Result<T>)->Result<T> {
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(3);
+    loop {
+        match operation() {
+            Ok(value)=>return Ok(value),
+            Err(error)=>{
+                let busy=error.chain().any(|cause|matches!(cause.downcast_ref::<rusqlite::Error>(),
+                    Some(rusqlite::Error::SqliteFailure(code,_)) if matches!(code.code,
+                        rusqlite::ErrorCode::DatabaseBusy|rusqlite::ErrorCode::DatabaseLocked)));
+                if !busy||std::time::Instant::now()>=deadline{return Err(error)}
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+}
+fn import_typed_database_range(root:&Path,from:&Path,binance:bool,range:Option<(i64,i64)>)->Result<()> {
     use marketcow_contracts::typed_v3::common::Source;
     use rusqlite::{OptionalExtension,params};
     ensure!(root.is_absolute()&&from.is_absolute()&&from.is_file()&&!from.is_symlink(),"migration_source_invalid");
@@ -276,17 +305,46 @@ fn import_typed_database(root:&Path,from:&Path,binance:bool)->Result<()> {
         source_database TEXT NOT NULL,source_evidence_key TEXT NOT NULL,
         PRIMARY KEY(source_database,source_evidence_key))")?;
     let source_identity=std::fs::canonicalize(from)?.to_string_lossy().into_owned();
+    // Explicit migration only: stream selected evidence IDs from indexed rows.
+    // Preparation may run while the old writer continues. This explicit
+    // migration has a bounded read snapshot; the stop-time pass replays only
+    // uncheckpointed evidence. No JSONL or whole-body/range copy is made.
+    let sql=if binance {
+        "SELECT sha256,length(raw) FROM evidence WHERE sha256 IN (
+           SELECT evidence_sha256 FROM binance_trades WHERE trade_time_ms>=?1 AND trade_time_ms<?2
+           UNION SELECT evidence_sha256 FROM binance_trades WHERE trade_id=(
+             SELECT trade_id FROM binance_trades WHERE trade_time_ms<?1 ORDER BY trade_id DESC LIMIT 1)) ORDER BY sha256"
+    }else{
+        "SELECT sha256,length(raw) FROM evidence WHERE sha256 IN (
+           SELECT evidence_sha256 FROM chainlink_observations WHERE source_time_ms>=?1 AND source_time_ms<?2)
+         ORDER BY sha256"
+    };
+    let mut selected=range.map(|_|source.prepare(sql)).transpose()?;
+    let mut selected_rows=match (&mut selected,range) {
+        (Some(stmt),Some((start,end)))=>Some(stmt.query(params![start,end])?),_=>None,
+    };
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(1200);
     let mut after=String::new();let mut frames=0u64;let mut inserted=0usize;let mut skipped=0u64;
     loop {
+        ensure!(std::time::Instant::now()<deadline,"migration_deadline");
         // A short read transaction and at most 8MiB owned payloads per batch.
-        let mut stmt=source.prepare("SELECT sha256,length(raw) FROM evidence WHERE sha256>? ORDER BY sha256 LIMIT 64")?;
-        let keys=stmt.query_map([&after],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);if keys.is_empty(){break;}
+        let keys=if let Some(rows)=&mut selected_rows {
+            let mut keys=Vec::with_capacity(64);
+            for _ in 0..64 {let Some(row)=rows.next()? else{break};keys.push((row.get::<_,String>(0)?,row.get::<_,i64>(1)?));}
+            keys
+        }else{
+            let mut stmt=source.prepare("SELECT sha256,length(raw) FROM evidence WHERE sha256>? ORDER BY sha256 LIMIT 64")?;
+            stmt.query_map([&after],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if keys.is_empty(){break;}
+        ensure!(frames+skipped+keys.len() as u64<=1_024_000,"migration_frame_capacity");
         let mut batch_bytes=0usize;
         for (key,size) in keys {
             ensure!(size>0 &&size<=1024*1024,"migration_evidence_capacity");
-            if batch_bytes>0 &&batch_bytes+size as usize>8*1024*1024 {break;}
+            // Cursor-selected keys must never be consumed then skipped.
+            // Bodies are loaded one at a time, not retained with the key batch.
+            if selected_rows.is_none()&&batch_bytes>0 &&batch_bytes+size as usize>8*1024*1024 {break;}
             batch_bytes+=size as usize;
             let done:Option<i64>=target.query_row("SELECT 1 FROM typed_legacy_imports WHERE source_database=? AND source_evidence_key=?",params![source_identity,key],|r|r.get(0)).optional()?;
             if done.is_some(){after=key;skipped+=1;continue;}
@@ -301,21 +359,30 @@ fn import_typed_database(root:&Path,from:&Path,binance:bool)->Result<()> {
                     else if acquisition=="official_recent_trades"{btc_typed_ingress::binance_recent(&raw,received.unwrap_or(0))?}
                     else{anyhow::bail!("migration_acquisition_unsupported")};
                 for row in &mut rows{row.received_at_ns=received;}
-                inserted+=btc_typed_store::insert_trades(&mut target,&rows,&input)?;
+                inserted+=retry_migration_busy(||btc_typed_store::insert_trades(&mut target,&rows,&input))?;
             }else {
                 ensure!(acquisition=="authenticated_chainlink_ws","migration_acquisition_unsupported");
                 let mut parsed=btc_typed_ingress::chainlink(&raw,received.unwrap_or(0),Source::ChainlinkBtcUsdTwap60)?;
                 for row in &mut parsed.rows{row.received_at_ns=received;}
-                inserted+=btc_typed_store::insert_observations(&mut target,parsed.source,generation.as_deref().context("migration_generation_missing")?,&parsed.rows,&input)?;
+                let generation=generation.as_deref().context("migration_generation_missing")?;
+                inserted+=retry_migration_busy(||btc_typed_store::insert_observations(&mut target,parsed.source,generation,&parsed.rows,&input))?;
             }
             // Crash between data commit and this checkpoint safely replays
             // semantic identity checks, rather than skipping an unwritten row.
-            target.execute("INSERT OR IGNORE INTO typed_legacy_imports VALUES (?,?)",params![source_identity,key])?;
+            retry_migration_busy(||Ok(target.execute("INSERT OR IGNORE INTO typed_legacy_imports VALUES (?,?)",params![source_identity,key])?))?;
             after=key;frames+=1;
         }
         eprintln!("typed migration committed_frames={frames} inserted_rows={inserted} already_imported={skipped}");
+        // Cooperate with the still-running original writer during pre-import;
+        // no transaction is held across this brief batch yield.
+        if range.is_some(){std::thread::sleep(std::time::Duration::from_millis(5));}
     }
-    println!("typed migration complete: frames={frames} inserted_rows={inserted} skipped={skipped}; coverage is not certified");
+    println!("{}",serde_json::json!({"schema_version":"marketcow.typed-db-import.v1",
+        "source_database":source_identity,"destination_database":destination,
+        "source":if binance{"binance_spot_trade"}else{"chainlink_twap_60s"},
+        "start_time_ms":range.map(|r|r.0),"end_time_ms":range.map(|r|r.1),
+        "frames_imported":frames,"rows_inserted":inserted,"frames_already_imported":skipped,
+        "coverage_verified":false,"reason":"explicit_import_requires_requested_range_coverage_verification"}));
     Ok(())
 }
 
@@ -328,6 +395,61 @@ fn import(root:&Path,source:&str)->Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn typed_database_busy_retry_does_not_retry_identity_failure() {
+        let mut calls=0;
+        let value=retry_migration_busy(||{
+            calls+=1;
+            if calls<3{return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),None).into())}
+            Ok(7)
+        }).unwrap();
+        assert_eq!(value,7);assert_eq!(calls,3);
+        calls=0;
+        assert!(retry_migration_busy(||->Result<()> {calls+=1;anyhow::bail!("trade identity conflict")}).is_err());
+        assert_eq!(calls,1);
+    }
+    #[test]
+    fn bounded_typed_database_import_includes_predecessor_and_resumes_same_database() {
+        let root=tempfile::tempdir().unwrap();
+        let folder=root.path().join("binance-trades");std::fs::create_dir(&folder).unwrap();
+        let path=folder.join("trades.sqlite3");let db=observation_db::open(&path).unwrap();
+        for id in 1..=80 {
+            let time=1000+id*100;
+            let raw=format!(r#"{{"e":"trade","s":"BTCUSDT","t":{id},"T":{time},"E":{time},"p":"100.00","q":"0.0100","m":false}}"#);
+            let key=format!("opaque-{id:04}");
+            db.execute("INSERT INTO evidence VALUES (?,?,?,?,?)",rusqlite::params![key,raw.as_bytes(),rusqlite::types::Null,"source-a","ws_trade"]).unwrap();
+            db.execute("INSERT INTO binance_trades VALUES (?,?,?,?,?,?,?,?,?)",rusqlite::params![id,time,time,"100","0.01",0,key,0,"source-a"]).unwrap();
+        }
+        drop(db);
+        import_typed_database_range(root.path(),&path,true,Some((2000,8500))).unwrap();
+        import_typed_database_range(root.path(),&path,true,Some((2000,8500))).unwrap();
+        let db=btc_typed_store::open_reader(&path).unwrap();
+        let rows=btc_typed_store::read_trades(&db,1,80,100).unwrap();
+        assert_eq!(rows.len(),66);assert_eq!(rows[0].trade_id,9);assert_eq!(rows.last().unwrap().trade_id,74);
+        assert_eq!(rows[0].price,"100.00");assert_eq!(rows[0].quantity,"0.0100");assert_eq!(rows[0].received_at_ns,None);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM typed_legacy_imports",[],|r|r.get::<_,i64>(0)).unwrap(),66);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM evidence",[],|r|r.get::<_,i64>(0)).unwrap(),80);
+    }
+    #[test]
+    fn bounded_typed_database_chainlink_import_preserves_real_frame_row_indices() {
+        let root=tempfile::tempdir().unwrap();
+        let folder=root.path().join("chainlink-twap");std::fs::create_dir(&folder).unwrap();
+        let path=folder.join("observations.sqlite3");let db=observation_db::open(&path).unwrap();
+        let raw=br#"{"v":1,"channel":"price.crypto.twap","seq":7,"snapshot":true,"payload":{"symbol":"btcusd","source":"chainlink","window_seconds":60,"data":[{"timestamp":1000,"full_accuracy_value":"100.00"},{"timestamp":1500,"full_accuracy_value":"101.00"}]}}"#;
+        db.execute("INSERT INTO evidence VALUES (?,?,?,?,?)",rusqlite::params!["opaque-a",raw.as_slice(),rusqlite::types::Null,"source-a","authenticated_chainlink_ws"]).unwrap();
+        for (index,time) in [1000,1500].into_iter().enumerate() {
+            db.execute("INSERT INTO chainlink_observations VALUES (?,?,?,?,?,?,?)",rusqlite::params!["twap60","source-a",7,time,"101","opaque-a",index as i64]).unwrap();
+        }
+        drop(db);
+        import_typed_database_range(root.path(),&path,false,Some((1200,2000))).unwrap();
+        let db=btc_typed_store::open_reader(&path).unwrap();
+        let rows=db.prepare("SELECT source,row_index,source_time_ms,price,received_at_ns FROM typed_chainlink_observations ORDER BY row_index").unwrap()
+            .query_map([],|r|Ok((r.get::<_,i32>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<i64>>(4)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(rows.len(),2);assert_eq!(rows[1].1,1);assert_eq!(rows[1].2,1500);assert_eq!(rows[1].3,"101.00");assert!(rows[1].4.is_none());
+        assert_eq!(rows[1].0,marketcow_contracts::typed_v3::common::Source::ChainlinkBtcUsdTwap60 as i32);
+    }
     #[test]
     fn typed_database_migration_is_explicit_idempotent_and_preserves_lexical_fields() {
         let root=tempfile::tempdir().unwrap();let source=root.path().join("existing.sqlite3");
