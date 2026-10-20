@@ -664,6 +664,17 @@ class PolymarketLiveTest(unittest.TestCase):
         store.replace_catalog(GammaLiveNormalizer.normalize(raw_rows, NOW), raw_rows)
         return store
 
+    def test_enabled_catalog_archival_only_enqueues_after_manifest_publication(self):
+        def check_published(root):
+            manifest = json.loads((root / "catalog.json").read_bytes())
+            self.assertTrue(Path(manifest["normalized_catalog"]["path"]).exists())
+            self.assertTrue(Path(manifest["catalog_index"]["path"]).exists())
+
+        with patch.dict("os.environ", {"MARKETCOW_CATALOG_ARCHIVE_ENABLED": "1"}):
+            with patch("marketcow.catalog_archive.request_compaction", side_effect=check_published) as enqueue:
+                store = self.store()
+                enqueue.assert_called_once_with(store.root)
+
     def test_gamma_keyset_complete_pagination_and_rate_limit_backoff(self):
         calls, sleeps = [], []
         responses = [
