@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use std::{collections::{BTreeMap, BTreeSet}, fs, path::PathBuf, time::Duration};
 use tokio::task::JoinSet;
 mod btc_research;
+mod sdk_access;
+mod btc_network;
 mod source_snapshot;
 #[allow(dead_code)]
 #[path = "live_source_bridge.rs"]
@@ -175,6 +177,13 @@ struct Args {
     /// Direct Rust public read API; does not require the internal WS listener.
     #[arg(long, requires_all = ["configured_scope", "dependency_plan", "public_full_sync_bytes", "public_snapshot_concurrency", "public_frame_bytes", "public_replay_bytes", "public_maximum_clients", "public_send_timeout_seconds"])]
     public_listen: Option<std::net::SocketAddr>,
+    /// Explicit private Proto customer policy; only then restrict public API to SDK routes.
+    #[arg(long, requires = "public_listen")]
+    sdk_access_policy: Option<PathBuf>,
+    /// Additional authenticated SDK boundary sharing the existing owners.
+    /// If absent, sdk-access-policy retains its original protect-all behavior.
+    #[arg(long, requires_all = ["public_listen", "sdk_access_policy"])]
+    sdk_listen: Option<std::net::SocketAddr>,
     #[arg(long, requires = "public_listen")]
     public_full_sync_bytes: Option<usize>,
     #[arg(long, requires = "public_listen")]
@@ -655,6 +664,9 @@ fn replay_pending_retirement(
 async fn main() -> Result<()> {
     marketcow_polymarket::diagnostic::install();
     let args = Args::parse();
+    if let Some(sdk) = args.sdk_listen {
+        sdk_access::validate_listener(args.public_listen,sdk)?;
+    }
     if let Some(output) = &args.offline_cold_output {
         let report = source_scope_migration::migrate(source_scope_migration::Inputs {
             source_root: &args.root,
@@ -1338,9 +1350,28 @@ async fn main() -> Result<()> {
             router = router.merge(btc_router);
         }
         control_backend = Some(source_scope_control::Backend::Live(control));
+        let sdk_server = if let Some(sdk) = args.sdk_listen {
+            let sdk_router = sdk_access::protect(router.clone(),
+                args.sdk_access_policy.clone().context("SDK policy required")?)?;
+            Some((tokio::net::TcpListener::bind(sdk).await?, sdk_router))
+        } else { None };
+        if args.sdk_listen.is_none() {
+          if let Some(path) = args.sdk_access_policy.clone() {
+            ensure!(listen.ip().is_loopback(),"SDK access boundary requires loopback listener behind a TLS terminator");
+            router = sdk_access::protect(router, path)?;
+          }
+        }
         let listener = tokio::net::TcpListener::bind(listen).await?;
         Some(tokio::spawn(
-            async move { axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await },
+            async move {
+                let internal = axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>());
+                if let Some((sdk_listener, sdk_router)) = sdk_server {
+                    tokio::try_join!(async { internal.await }, async {
+                        axum::serve(sdk_listener, sdk_router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await
+                    })?;
+                    Ok::<(), std::io::Error>(())
+                } else { internal.await }
+            },
         ))
     } else {
         None

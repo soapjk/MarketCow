@@ -1,0 +1,14 @@
+[package]
+name = "marketcow-wire"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Versioned public MarketCow Protobuf contracts; no service or client runtime"
+include = ["Cargo.toml", "src/**", "tests/**", "proto/**", "build.rs"]
+
+[dependencies]
+prost = "0.14"
+
+[build-dependencies]
+prost-build = "0.14"
+protoc-bin-vendored = "3"

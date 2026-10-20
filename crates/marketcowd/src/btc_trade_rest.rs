@@ -43,9 +43,7 @@ impl Service {
             }.await;
             if let Err(error) = result { tracing::warn!(%error, "binance_rest_archive_unavailable"); }
         });
-        Ok(Self {client: reqwest::Client::builder().no_proxy()
-            .timeout(TIMEOUT).redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never()).build()?,
+        Ok(Self {client: crate::btc_network::client(TIMEOUT)?,
             slots: Arc::new(Semaphore::new(8)), archive, archive_dropped: dropped,identity_database})
     }
     pub fn router(&self)->axum::Router {

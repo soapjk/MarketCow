@@ -1257,8 +1257,10 @@ name = "marketcow-contracts"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "marketcow-wire",
  "prost",
  "prost-build",
+ "prost-types",
  "protoc-bin-vendored",
  "serde",
  "serde_json",
@@ -1377,6 +1379,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "marketcow-wire"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-build",
+ "protoc-bin-vendored",
+]
+
+[[package]]
 name = "marketcowd"
 version = "0.1.0"
 dependencies = [
@@ -1389,6 +1400,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http",
+ "http-body-util",
  "im",
  "libc",
  "marketcow-api",

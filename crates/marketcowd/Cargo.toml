@@ -24,7 +24,12 @@ path = "src/live_source_bridge.rs"
 name = "marketcow-btc-db-migrate"
 path = "src/btc_observation_migrate.rs"
 
+[[bin]]
+name = "marketcow-sdk-policy"
+path = "src/sdk_policy.rs"
+
 [dependencies]
+http-body-util = "0.1"
 anyhow.workspace = true
 rusqlite.workspace = true
 arc-swap.workspace = true

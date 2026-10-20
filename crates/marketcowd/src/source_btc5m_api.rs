@@ -902,6 +902,7 @@ async fn capture_native_state(api:&Api,binding:MarketBinding)->Result<Arc<crate:
     }).await?
 }
 async fn http_native_market_stream(State(api):State<Api>,query:Result<Query<LiveStreamQuery>,axum::extract::rejection::QueryRejection>,
+    lease:Option<axum::Extension<crate::sdk_access::Lease>>,
     peer:Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,headers:HeaderMap,
     ws:Result<WebSocketUpgrade,axum::extract::ws::rejection::WebSocketUpgradeRejection>)->Response {
     use marketcow_contracts::typed_v3 as native;
@@ -926,6 +927,7 @@ async fn http_native_market_stream(State(api):State<Api>,query:Result<Query<Live
     let Ok(market_permit)=slots.try_acquire_owned() else{return crate::btc_typed_api::failure(StatusCode::SERVICE_UNAVAILABLE,"market_stream_capacity",true)};
     let Ok(permit)=api.streams.clone().try_acquire_owned()else{return crate::btc_typed_api::failure(StatusCode::SERVICE_UNAVAILABLE,"market_stream_capacity",true)};
     ws.protocols([native::MARKET_SUBPROTOCOL]).max_message_size(4096).max_frame_size(4096).on_upgrade(move|socket|async move {
+        let lease=lease.map(|axum::Extension(v)|v);
         let (_permit,_market_permit)=(permit,market_permit);
         let mut socket=MarketClientIo::new(socket);
         socket.peer=peer.map(|axum::Extension(axum::extract::ConnectInfo(addr))|addr);
@@ -934,6 +936,7 @@ async fn http_native_market_stream(State(api):State<Api>,query:Result<Query<Live
             let mut previous:Option<Arc<crate::source_market_live_v7::State>>=None;
             let mut tick=tokio::time::interval(Duration::from_millis(10));tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {tokio::select! {
+                _=async {match &lease {Some(lease)=>lease.expired().await,None=>std::future::pending().await}}=>break,
                 control=socket.controls.recv()=>{if socket.handle_control(control,api.limits.send_timeout).await?{break;}},
                 _=tick.tick()=>{
                     let state=capture_native_state(&api,binding.clone()).await?;
@@ -941,6 +944,7 @@ async fn http_native_market_stream(State(api):State<Api>,query:Result<Query<Live
                     if previous.as_ref().is_some_and(|p|p.sequence==state.sequence){continue;}
                     let message=crate::source_market_live_v7::frame(&state,previous.as_deref(),Utc::now().to_rfc3339())?;
                     let bytes=native::encode(&message,crate::source_market_live_v7::MAX_BYTES)?;
+                    if let Some(lease)=&lease {lease.charge(bytes.len())?;}
                     socket.in_flight_cursor=Some(state.sequence);
                     send_market_frame(&mut socket,&api,bytes).await?;
                     socket.last_complete_cursor=state.sequence;socket.in_flight_cursor=None;

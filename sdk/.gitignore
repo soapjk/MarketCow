@@ -1,0 +1,16 @@
+target/
+dist/
+build/
+.venv*/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+*.so
+*.dylib
+*.pyd
+*.whl
+.env
+.env.*
+.corptie/
+.DS_Store

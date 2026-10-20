@@ -27,25 +27,3 @@ jobs:
         run: uv run ruff check src tests
       - name: Test
         run: uv run python -m unittest discover -s tests -v
-
-  python-sdk:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-      - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
-      - name: Check SDK lockfile
-        run: uv lock --project sdk/python --check
-      - name: Test SDK
-        run: >-
-          uv run --project sdk/python --with pytest --with pytest-asyncio
-          pytest -q sdk/python/tests
-      - name: Lint SDK
-        run: >-
-          uv run --project sdk/python --with ruff
-          ruff check sdk/python/src sdk/python/tests sdk/python/examples
-      - name: Build SDK wheel
-        run: uv build --project sdk/python

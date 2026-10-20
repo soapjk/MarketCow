@@ -212,12 +212,14 @@ impl Service {
             .route("/v1/btc-research/status", get(status))
             .with_state(Arc::new((self.minute.clone(), self.second.clone(), self.trade.clone())));
         let minute_routes = Router::new()
+            .route("/v3/btc/bars/1m", get(typed_window))
             .route("/v1/btc-research/bootstrap", get(bootstrap))
             .route("/v1/btc-research/finalized-1m-window", get(window))
             .route("/v1/btc-research/facts", get(facts))
             .route("/v1/btc-research/stream", get(stream))
             .with_state(self.minute.clone());
         let second_routes = Router::new()
+            .route("/v3/btc/bars/1s", get(typed_window))
             .route("/v1/btc-research/finalized-1s-window", get(window))
             .route("/v1/btc-research/finalized-1s-facts", get(facts))
             .with_state(self.second.clone());
@@ -368,14 +370,7 @@ async fn writer_task(shared: Arc<Shared>, mut receiver: mpsc::Receiver<Persist>,
 }
 
 async fn acquisition_task(shared: Arc<Shared>) {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::none())
-        // The formal collector exports a deliberately Polymarket-only proxy.
-        // Binance Vision is an independent official direct source and must not
-        // be routed into that rejecting proxy policy.
-        .no_proxy()
-        .build()
+    let client = match crate::btc_network::client(Duration::from_secs(15))
     {
         Ok(v) => v,
         Err(e) => {
@@ -424,7 +419,7 @@ async fn acquire_once(shared: &Arc<Shared>, client: &reqwest::Client) -> Result<
         bootstrap_once(shared, client).await?;
     }
     repair_gap_once(shared, client).await?;
-    let (socket, _) = tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(shared.spec.ws_url))
+    let socket = tokio::time::timeout(WS_CONNECT_TIMEOUT, crate::btc_network::connect(shared.spec.ws_url, None))
         .await
         .context("Binance WS connect timeout")?
         .context("Binance WS connect")?;
@@ -1102,6 +1097,80 @@ async fn window(State(shared): State<Arc<Shared>>) -> Response {
     }
 }
 
+fn typed_window_for_expected(s: &Runtime, spec: FeedSpec, expected: i64)
+    -> Result<marketcow_contracts::typed_v3::btc::FinalizedWindow> {
+    typed_window_after(s,spec,expected,None)
+}
+fn typed_window_after(s:&Runtime,spec:FeedSpec,expected:i64,after:Option<i64>)
+    -> Result<marketcow_contracts::typed_v3::btc::FinalizedWindow> {
+    use marketcow_contracts::typed_v3::btc::{FinalizedBar, FinalizedWindow};
+    let checkpoint = s.durable_checkpoint.as_ref();
+    let ready = s.phase == "joined"
+        && s.readiness_sequence.is_some_and(|v| v <= s.durable)
+        && checkpoint.is_some_and(|c| c.sequence <= s.durable
+            && c.bars.len() == spec.bar_count
+            && c.bars.last().and_then(|b| b["open_time_ms"].as_i64()) == Some(expected));
+    let start=checkpoint.map_or(0,|c|after.map_or(0,|after|c.bars.partition_point(|b|
+        b["open_time_ms"].as_i64().is_some_and(|t|t<=after))));
+    let mut bars = Vec::with_capacity(checkpoint.map_or(0, |c| c.bars.len().saturating_sub(start)));
+    if let Some(checkpoint) = checkpoint {
+        for row in &checkpoint.bars[start..] {
+            // Read the original owner columns. No JSON encoding, hashing,
+            // archive read, or independent upstream collection is performed.
+            let text = |key: &str| -> Result<String> {
+                Ok(row[key].as_str().with_context(|| format!("bar missing {key}"))?.into())
+            };
+            bars.push(FinalizedBar {
+                open_time_ms: row["open_time_ms"].as_i64().context("bar open time")?,
+                close_time_ms: row["close_time_ms"].as_i64().context("bar close time")?,
+                open: text("open")?, high: text("high")?, low: text("low")?, close: text("close")?,
+                base_volume: row["base_volume"].as_str().or_else(|| row["volume"].as_str())
+                    .context("bar base volume")?.into(),
+                quote_volume: text("quote_volume")?, trade_count: row["trade_count"].as_u64().context("bar trades")?,
+                taker_buy_base_volume: text("taker_buy_base_volume")?,
+                taker_buy_quote_volume: text("taker_buy_quote_volume")?,
+                source_event_time_ms: row["source_event_time_ms"].as_i64(),
+                available_at: row["available_at"].as_str().map(str::to_owned),
+                provenance_kind: row["provenance_kind"].as_str().map(str::to_owned),
+            });
+        }
+    }
+    Ok(FinalizedWindow {
+        schema_version: "marketcow.binance-finalized-window.v3".into(),
+        instrument_id: "BTCUSDT.BINANCE".into(), interval_ms: spec.step_ms.try_into()?,
+        stream_id: s.epoch.clone(), ready,
+        reason: (!ready).then(|| "durable_finalized_window_unavailable_or_stale".into()),
+        checkpoint_sequence: checkpoint.map_or(0, |c| c.sequence), durable_sequence: s.durable,
+        expected_last_open_ms: expected, bars,
+        after_open_ms:after,
+        retained_first_open_ms:checkpoint.and_then(|c|c.bars.first()).and_then(|b|b["open_time_ms"].as_i64()),
+        window_bar_count:checkpoint.map_or(0,|c|c.bars.len() as u32),
+        gap:after.is_some_and(|after|checkpoint.and_then(|c|c.bars.first())
+            .and_then(|b|b["open_time_ms"].as_i64()).is_some_and(|first|after.saturating_add(spec.step_ms)<first)),
+    })
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedBarQuery {after_open_ms:Option<i64>}
+async fn typed_window(State(shared): State<Arc<Shared>>,Query(query):Query<TypedBarQuery>) -> Response {
+    use prost::Message;
+    let state = shared.state.read().await;
+    let value = typed_window_after(&state, shared.spec, expected_last_open_for(shared.spec.step_ms),query.after_open_ms);
+    drop(state);
+    match value {
+        Ok(value) if value.encoded_len() <= shared.config.response_bytes.min(4 * 1024 * 1024) => (
+            [("content-type", "application/x-protobuf"), ("cache-control", "no-store")], value.encode_to_vec(),
+        ).into_response(),
+        Ok(_) => (StatusCode::PAYLOAD_TOO_LARGE,
+            [("content-type", "application/x-protobuf"), ("cache-control", "no-store")],
+            marketcow_contracts::typed_v3::common::Error {code: "response_capacity".into(),
+                retryable: false, ..Default::default()}.encode_to_vec()).into_response(),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE,
+            [("content-type", "application/x-protobuf"), ("cache-control", "no-store")],
+            marketcow_contracts::typed_v3::common::Error {code: "bar_state_invalid".into(),
+                retryable: false, ..Default::default()}.encode_to_vec()).into_response(),
+    }
+}
 fn window_json_for_expected(s: &Runtime, spec: FeedSpec, expected: i64) -> Option<Value> {
     let Some(c) = &s.durable_checkpoint else {
         return None;
@@ -1370,6 +1439,20 @@ mod tests {
         assert_eq!(bar["source_event_time_ms"], Value::Null);
     }
 
+    #[test]
+    fn typed_window_preserves_exact_bar_fields_and_does_not_claim_stale_ready() {
+        let first=SECOND_FIXTURE_FIRST_MS;
+        let expected=first+299_000;
+        let mut state=Runtime::with_epoch("typed-bars".into());
+        state.phase="joined";state.readiness_sequence=Some(3);state.durable=3;
+        state.durable_checkpoint=Some(Checkpoint {sequence:3,bars:second_window_fixture(first),sha256:String::new()});
+        let value=typed_window_for_expected(&state,SECOND,expected).unwrap();
+        assert!(value.ready);assert_eq!(value.bars.len(),300);
+        assert_eq!(value.bars[0].open_time_ms,first);
+        assert!(!typed_window_for_expected(&state,SECOND,expected+1000).unwrap().ready);
+        state.durable=2;
+        assert!(!typed_window_for_expected(&state,SECOND,expected).unwrap().ready);
+    }
     #[test]
     fn second_window_requires_durable_current_checkpoint_and_hashes_canonical_bars() {
         let first = SECOND_FIXTURE_FIRST_MS;

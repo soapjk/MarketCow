@@ -1,0 +1,45 @@
+syntax = "proto3";
+package marketcow.btc.v3;
+import "marketcow/common/v1/types.proto";
+import "marketcow/btc/v3/history.proto";
+
+// This is the BTC router's implemented surface, not a statement of history
+// coverage, subscription entitlement, or fresh/decision-ready data.
+message SourceCapability {
+  marketcow.common.v1.Source source = 1;
+  string instrument_id = 2;
+  bool price_stream = 3;
+  bool indexed_history = 4;
+  bool collector_present = 5;
+}
+message BtcCapabilities {
+  string schema_version = 1; // marketcow.btc-capabilities.v3
+  repeated SourceCapability sources = 2;
+  uint32 history_page_limit = 3;
+  uint32 history_maximum_pages = 4;
+  uint64 history_maximum_rows = 5;
+  uint64 history_maximum_bytes = 6;
+  uint32 history_maximum_span_ms = 7;
+  uint32 history_session_ttl_seconds = 8;
+  bool history_explicit_release = 9;
+  bool history_request_identity = 10;
+}
+message SourceHealth {
+  marketcow.common.v1.Source source = 1;
+  string instrument_id = 2;
+  string phase = 3;
+  optional string reason = 4;
+  optional string stream_id = 5;
+  optional uint64 stream_sequence = 6;
+  optional uint64 source_sequence = 7;
+  optional int64 latest_source_time_ms = 8;
+  // Diagnostic only; never clamped, and not a decision freshness policy.
+  optional int64 signed_source_age_ms = 9;
+  marketcow.btc.history.v3.Health database = 10;
+  marketcow.btc.history.v3.Health archive = 11;
+}
+message BtcHealth {
+  string schema_version = 1; // marketcow.btc-health.v3
+  int64 reported_at_ns = 2; // Diagnostic wall clock, not supplier time.
+  repeated SourceHealth sources = 3;
+}

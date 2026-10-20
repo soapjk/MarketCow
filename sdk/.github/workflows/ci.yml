@@ -1,0 +1,95 @@
+name: Native SDK
+on:
+  workflow_dispatch:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            zig: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            zig: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            zig: false
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            zig: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Build platform wheel (no publish)
+        working-directory: python
+        env:
+          SDK_TARGET: ${{ matrix.target }}
+          SDK_ZIG: ${{ matrix.zig }}
+        run: |
+          if [ "$SDK_ZIG" = true ]; then
+            uv tool run --from maturin --with ziglang maturin build --locked --release --target "$SDK_TARGET" --zig --out ../dist
+          else
+            uv tool run --from maturin maturin build --locked --release --target "$SDK_TARGET" --out ../dist
+          fi
+      - name: Install and exercise wheel when target matches runner
+        env:
+          SDK_TARGET: ${{ matrix.target }}
+        run: |
+          case "$(uname -s)-$(uname -m)-$SDK_TARGET" in
+            Darwin-arm64-aarch64-apple-darwin|Darwin-x86_64-x86_64-apple-darwin|Linux-x86_64-x86_64-unknown-linux-gnu|Linux-aarch64-aarch64-unknown-linux-gnu)
+              uv venv --python 3.11 "$RUNNER_TEMP/sdk-wheel-check"
+              uv pip install --python "$RUNNER_TEMP/sdk-wheel-check/bin/python" dist/*.whl 'pytest>=8,<9' 'pytest-asyncio>=0.23,<1'
+              "$RUNNER_TEMP/sdk-wheel-check/bin/python" -m pytest -q python/tests
+              ;;
+            *) echo 'Cross-built artifact: native-runner acceptance still required.' ;;
+          esac
+      - name: Retain platform installable (no registry publish)
+        uses: actions/upload-artifact@v4
+        with:
+          name: marketcow-client-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+  offline-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+      - name: Check Python lockfile
+        run: uv lock --project python --check
+      - name: Lint Python SDK
+        run: uv run --project python --extra dev ruff check python/src python/tests python/examples
+      - run: cargo test --locked -p marketcow-wire -p marketcow-sdk
+      - name: Build source distribution and wheel from it
+        working-directory: python
+        # Maturin reduces the workspace in the sdist; Cargo must normalize the
+        # copied lockfile for that reduced workspace. Repository builds above
+        # stay --locked; source consumers do not inherit unrelated members.
+        run: uv tool run --from maturin maturin build --sdist --out ../dist
+      - name: Build the source distribution outside this checkout
+        run: |
+          mkdir "$RUNNER_TEMP/sdk-sdist"
+          tar -xzf dist/*.tar.gz -C "$RUNNER_TEMP/sdk-sdist"
+          cd "$RUNNER_TEMP/sdk-sdist"/*
+          uv tool run --from maturin maturin build --release --out "$RUNNER_TEMP/sdk-sdist-wheel"
+      - name: Native Python tests
+        run: uv run --project python --extra dev pytest -q python/tests
+      - name: Retain source distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: marketcow-client-source
+          path: dist/*.tar.gz
+          if-no-files-found: error
