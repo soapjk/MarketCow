@@ -1068,6 +1068,11 @@ def _atomic_write_catalog(
     if realtime_universe is not None:
         manifest["realtime_universe"] = realtime_universe
     _atomic_write(path, canonical_json(manifest))
+    # Coalesce maintenance off the publication/realtime path. Only verified
+    # historical materializations may be removed; current offset readers stay hot.
+    if os.environ.get("MARKETCOW_CATALOG_ARCHIVE_ENABLED", "0").lower() in {"1", "true"}:
+        from .catalog_archive import request_compaction
+        request_compaction(path.parent)
     return normalized
 
 
